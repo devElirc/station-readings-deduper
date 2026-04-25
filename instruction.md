@@ -19,7 +19,10 @@ Write /app/output/deduped.csv with columns timestamp, station_id, temperature_c 
 Sort rows by station_id ascending using Python’s default string ordering on the written station_id, then by utc_instant chronological ascending (not lexicographic on timestamp strings).
 
 Also write /app/output/stats.json as a JSON object with: duplicate_rows_dropped (non-skipped input rows minus distinct dedupe keys after last-wins), skipped_malformed_rows, deduped_row_count, station_count, median_temperature_c_all (string: median of every retained temperature after dedupe, pooling all stations), and stations (array sorted by station_id ascending on the written ids). 
-Each station entry is {"station_id": "<id>", "readings": <int>, "min_temperature_c": "<string>", "max_temperature_c": "<string>", "median_temperature_c": "<string>", "avg_temperature_c": "<string>"} from that station’s retained temperatures after dedupe. Median: sort floats ascending; odd count → middle element; even → mean of the two middle elements. 
+Each station entry is {"station_id": "<id>", "readings": <int>, "min_temperature_c": "<string>", "max_temperature_c": "<string>", "median_temperature_c": "<string>", "avg_temperature_c": "<string>"} from that station’s retained temperatures after dedupe. 
+To calculate the median, sort the numbers from smallest to largest.
+If there is an odd number of values, use the middle one.
+If there is an even number of values, use the average of the two middle values.
 Format min, max, median, and avg with exactly one digit after the decimal using Python round(x, 1) then str, mapping -0.0 to "0.0" if it appears.
 
 Create /app/output if it is missing.
