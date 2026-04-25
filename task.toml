@@ -10,11 +10,11 @@ number_of_milestones = 0
 codebase_size = "minimal"
 languages = ["python", "bash"]
 tags = ["csv", "python", "deduplication", "json", "data-cleaning"]
-expert_time_estimate_min = 45
-junior_time_estimate_min = 120
+expert_time_estimate_min = 55
+junior_time_estimate_min = 150
 
 [verifier]
-timeout_sec = 300.0
+timeout_sec = 450.0
 
 [agent]
 timeout_sec = 900.0

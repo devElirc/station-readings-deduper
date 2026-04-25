@@ -14,27 +14,49 @@ DEDUPED_CSV = Path("/app/output/deduped.csv")
 STATS_JSON = Path("/app/output/stats.json")
 
 
-def _fmt_avg(mean: float) -> str:
-    """Match instruction: round(mean, 1) then str; zero maps to 0.0."""
-    r = round(mean, 1)
+def _fmt_decimal(x: float) -> str:
+    """One decimal place: round(x, 1) then str; -0.0 maps to 0.0."""
+    r = round(x, 1)
     if r == 0:
         return "0.0"
     return str(r)
 
 
+def _median_from_sorted_values(vals: list[float]) -> float:
+    """Median: sort ascending; odd -> middle; even -> mean of two middles."""
+    s = sorted(vals)
+    n = len(s)
+    mid = n // 2
+    if n % 2:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
 def _reference_from_input() -> tuple[list[tuple[str, str, float]], dict]:
     """Recompute expected deduped rows and stats from the bundled CSV (utf-8-sig)."""
+    skipped_malformed_rows = 0
     rows_in_order: list[tuple[str, str, float]] = []
     with INPUT_CSV.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            rows_in_order.append(
-                (
-                    row["station_id"].strip(),
-                    row["timestamp"].strip(),
-                    float(row["temperature_c"]),
-                )
-            )
+            sid_raw = row.get("station_id")
+            ts_raw = row.get("timestamp")
+            tc_raw = row.get("temperature_c")
+            sid = (sid_raw or "").strip()
+            ts = (ts_raw or "").strip()
+            if not sid or not ts:
+                skipped_malformed_rows += 1
+                continue
+            if tc_raw is None or str(tc_raw).strip() == "":
+                skipped_malformed_rows += 1
+                continue
+            try:
+                temp = float(str(tc_raw).strip())
+            except ValueError:
+                skipped_malformed_rows += 1
+                continue
+            rows_in_order.append((sid, ts, temp))
+
     total_in = len(rows_in_order)
     last_temp: dict[tuple[str, str], float] = {}
     for sid, ts, temp in rows_in_order:
@@ -48,21 +70,32 @@ def _reference_from_input() -> tuple[list[tuple[str, str, float]], dict]:
     by_station: dict[str, list[float]] = {}
     for sid, _ts, temp in deduped:
         by_station.setdefault(sid, []).append(temp)
+
+    all_temps = [temp for _sid, _ts, temp in deduped]
+    median_all = _median_from_sorted_values(all_temps)
+
     stations = []
     for sid in sorted(by_station.keys()):
         temps = by_station[sid]
         mean = sum(temps) / len(temps)
+        med = _median_from_sorted_values(temps)
         stations.append(
             {
                 "station_id": sid,
                 "readings": len(temps),
-                "avg_temperature_c": _fmt_avg(mean),
+                "min_temperature_c": _fmt_decimal(min(temps)),
+                "max_temperature_c": _fmt_decimal(max(temps)),
+                "median_temperature_c": _fmt_decimal(med),
+                "avg_temperature_c": _fmt_decimal(mean),
             }
         )
+
     stats = {
         "duplicate_rows_dropped": dropped,
+        "skipped_malformed_rows": skipped_malformed_rows,
         "deduped_row_count": len(deduped),
         "station_count": len(by_station),
+        "median_temperature_c_all": _fmt_decimal(median_all),
         "stations": stations,
     }
     return deduped, stats
@@ -205,19 +238,32 @@ def test_stats_schema():
     data = json.loads(STATS_JSON.read_text())
     assert set(data.keys()) == {
         "duplicate_rows_dropped",
+        "skipped_malformed_rows",
         "deduped_row_count",
         "station_count",
+        "median_temperature_c_all",
         "stations",
     }
     assert isinstance(data["duplicate_rows_dropped"], int)
+    assert isinstance(data["skipped_malformed_rows"], int)
     assert isinstance(data["deduped_row_count"], int)
     assert isinstance(data["station_count"], int)
+    assert isinstance(data["median_temperature_c_all"], str)
     assert isinstance(data["stations"], list)
     for entry in data["stations"]:
         assert set(entry.keys()) == {
             "station_id",
             "readings",
+            "min_temperature_c",
+            "max_temperature_c",
+            "median_temperature_c",
             "avg_temperature_c",
         }
         assert isinstance(entry["readings"], int)
-        assert isinstance(entry["avg_temperature_c"], str)
+        for k in (
+            "min_temperature_c",
+            "max_temperature_c",
+            "median_temperature_c",
+            "avg_temperature_c",
+        ):
+            assert isinstance(entry[k], str)
