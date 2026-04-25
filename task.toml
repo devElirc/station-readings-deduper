@@ -3,15 +3,15 @@ version = "2.0"
 [metadata]
 author_name = "anonymous"
 author_email = "anonymous"
-difficulty = "medium"
+difficulty = "hard"
 category = "data-processing"
 subcategories = []
 number_of_milestones = 0
 codebase_size = "minimal"
 languages = ["python", "bash"]
 tags = ["csv", "python", "deduplication", "json", "data-cleaning"]
-expert_time_estimate_min = 25
-junior_time_estimate_min = 60
+expert_time_estimate_min = 45
+junior_time_estimate_min = 120
 
 [verifier]
 timeout_sec = 300.0

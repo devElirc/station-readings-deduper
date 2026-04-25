@@ -28,7 +28,7 @@ def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     rows_in_order: list[tuple[str, str, float]] = []
-    with INPUT_PATH.open(newline="") as f:
+    with INPUT_PATH.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
             rows_in_order.append(
@@ -45,6 +45,7 @@ def main() -> None:
         last_temp[(sid, ts)] = temp
 
     duplicate_rows_dropped = total_in - len(last_temp)
+    deduped_row_count = len(last_temp)
 
     deduped_rows = [
         (sid, ts, last_temp[(sid, ts)])
@@ -76,6 +77,7 @@ def main() -> None:
 
     stats = {
         "duplicate_rows_dropped": duplicate_rows_dropped,
+        "deduped_row_count": deduped_row_count,
         "station_count": len(by_station),
         "stations": stations,
     }
