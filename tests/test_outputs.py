@@ -2,16 +2,36 @@
 
 import csv
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 INPUT_CSV = Path("/app/inputs/station_readings.csv")
 SCRIPT_PATH = Path("/app/dedupe_report.py")
 DEDUPED_CSV = Path("/app/output/deduped.csv")
 STATS_JSON = Path("/app/output/stats.json")
+
+
+def _parse_instant(ts: str) -> datetime | None:
+    """Parse timestamp per instruction; None if malformed."""
+    t = ts.strip()
+    if not t:
+        return None
+    try:
+        if t.endswith("Z"):
+            t = t[:-1] + "+00:00"
+        dt = datetime.fromisoformat(t)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
 
 
 def _fmt_decimal(x: float) -> str:
@@ -35,7 +55,7 @@ def _median_from_sorted_values(vals: list[float]) -> float:
 def _reference_from_input() -> tuple[list[tuple[str, str, float]], dict]:
     """Recompute expected deduped rows and stats from the bundled CSV (utf-8-sig)."""
     skipped_malformed_rows = 0
-    rows_in_order: list[tuple[str, str, float]] = []
+    rows_in_order: list[tuple[str, str, float, datetime]] = []
     with INPUT_CSV.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -47,6 +67,10 @@ def _reference_from_input() -> tuple[list[tuple[str, str, float]], dict]:
             if not sid or not ts:
                 skipped_malformed_rows += 1
                 continue
+            inst = _parse_instant(ts)
+            if inst is None:
+                skipped_malformed_rows += 1
+                continue
             if tc_raw is None or str(tc_raw).strip() == "":
                 skipped_malformed_rows += 1
                 continue
@@ -55,18 +79,20 @@ def _reference_from_input() -> tuple[list[tuple[str, str, float]], dict]:
             except ValueError:
                 skipped_malformed_rows += 1
                 continue
-            rows_in_order.append((sid, ts, temp))
+            if not math.isfinite(temp):
+                skipped_malformed_rows += 1
+                continue
+            rows_in_order.append((sid, ts, temp, inst))
 
     total_in = len(rows_in_order)
-    last_temp: dict[tuple[str, str], float] = {}
-    for sid, ts, temp in rows_in_order:
-        last_temp[(sid, ts)] = temp
-    dropped = total_in - len(last_temp)
-    deduped = [
-        (sid, ts, last_temp[(sid, ts)])
-        for (sid, ts) in last_temp
-    ]
-    deduped.sort(key=lambda r: (r[0], r[1]))
+    last_win: dict[tuple[str, datetime], tuple[str, str, float]] = {}
+    for sid, ts, temp, inst in rows_in_order:
+        last_win[(sid, inst)] = (sid, ts, temp)
+
+    dropped = total_in - len(last_win)
+    deduped = list(last_win.values())
+    deduped.sort(key=lambda r: (r[0], _parse_instant(r[1]) or datetime.min.replace(tzinfo=timezone.utc)))
+
     by_station: dict[str, list[float]] = {}
     for sid, _ts, temp in deduped:
         by_station.setdefault(sid, []).append(temp)
@@ -98,7 +124,8 @@ def _reference_from_input() -> tuple[list[tuple[str, str, float]], dict]:
         "median_temperature_c_all": _fmt_decimal(median_all),
         "stations": stations,
     }
-    return deduped, stats
+    out_rows = [(sid, ts, temp) for sid, ts, temp in deduped]
+    return out_rows, stats
 
 
 def _assert_csv_matches(expected_rows: list[tuple[str, str, float]]) -> None:
@@ -222,7 +249,7 @@ def test_script_rebuild_matches_reference():
 
 
 def test_deduped_csv_matches_reference():
-    """Verify deduped rows and lexicographic station sort match recomputation from input."""
+    """Verify deduped rows; station_id lex sort then UTC instant chronological order."""
     expected_rows, _ = _reference_from_input()
     _assert_csv_matches(expected_rows)
 
