@@ -10,8 +10,9 @@ cat > /app/dedupe_report.py << 'PY'
 import csv
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 INPUT_PATH = Path("/app/inputs/station_readings.csv")
 REGISTRY_PATH = Path("/app/inputs/station_registry.json")
@@ -21,19 +22,51 @@ STATS_PATH = OUTPUT_DIR / "stats.json"
 QUALITY_CODES = ("OK", "WARN", "EST")
 
 
-def parse_instant(ts: str) -> datetime | None:
+def localize_naive(naive: datetime, zone_name: str) -> tuple[datetime, bool]:
+    zone = ZoneInfo(zone_name)
+
+    def candidates(wall: datetime) -> list[datetime]:
+        valid = []
+        for fold in (0, 1):
+            aware = wall.replace(tzinfo=zone, fold=fold)
+            roundtrip = aware.astimezone(timezone.utc).astimezone(zone)
+            if roundtrip.replace(tzinfo=None) == wall:
+                valid.append(aware)
+        return valid
+
+    current = naive
+    shifted = False
+    for _ in range(24 * 60 + 1):
+        valid = candidates(current)
+        if valid:
+            instant = max(valid, key=lambda dt: dt.astimezone(timezone.utc))
+            return instant.astimezone(timezone.utc), shifted
+        current += timedelta(minutes=1)
+        shifted = True
+    raise ValueError("could not resolve nonexistent local time")
+
+
+def parse_instant(
+    ts: str, station_id: str | None = None, zones: dict[str, str] | None = None
+) -> tuple[datetime | None, bool]:
     t = ts.strip()
     if not t:
-        return None
+        return None, False
     try:
         if t.endswith("Z"):
             t = t[:-1] + "+00:00"
         dt = datetime.fromisoformat(t)
     except ValueError:
-        return None
+        return None, False
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        zone_name = "UTC"
+        if station_id is not None and zones is not None:
+            zone_name = zones.get(station_id, "UTC")
+        try:
+            return localize_naive(dt, zone_name)
+        except Exception:
+            return None, False
+    return dt.astimezone(timezone.utc), False
 
 
 def fmt_decimal(x: float) -> str:
@@ -51,17 +84,33 @@ def median_from_values(vals: list[float]) -> float:
     return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
-def load_registry() -> tuple[dict[str, str], list[dict], list[dict]]:
+def resolve_alias(station_id: str, aliases: dict[str, str]) -> str:
+    seen: dict[str, int] = {}
+    current = station_id
+    while current in aliases:
+        if current in seen:
+            cycle = list(seen)[seen[current] :]
+            return min(cycle)
+        seen[current] = len(seen)
+        current = aliases[current]
+    return current
+
+
+def load_registry() -> tuple[dict[str, str], dict[str, str], list[dict], list[dict]]:
     data = json.loads(REGISTRY_PATH.read_text())
     aliases = {str(k).strip(): str(v).strip() for k, v in data["aliases"].items()}
+    zones = {
+        resolve_alias(str(k).strip(), aliases): str(v).strip()
+        for k, v in data.get("station_timezones", {}).items()
+    }
 
     suppressions = []
     for item in data["suppressions"]:
         suppressions.append(
             {
                 "station_id": str(item["station_id"]).strip(),
-                "start": parse_instant(str(item["start"])),
-                "end": parse_instant(str(item["end"])),
+                "start": parse_instant(str(item["start"]))[0],
+                "end": parse_instant(str(item["end"]))[0],
             }
         )
 
@@ -70,13 +119,13 @@ def load_registry() -> tuple[dict[str, str], list[dict], list[dict]]:
         calibrations.append(
             {
                 "station_id": str(item["station_id"]).strip(),
-                "start": parse_instant(str(item["start"])),
-                "end": parse_instant(str(item["end"])),
+                "start": parse_instant(str(item["start"]))[0],
+                "end": parse_instant(str(item["end"]))[0],
                 "offset_c": float(item["offset_c"]),
                 "index": idx,
             }
         )
-    return aliases, suppressions, calibrations
+    return aliases, zones, suppressions, calibrations
 
 
 def in_interval(instant: datetime, start: datetime, end: datetime) -> bool:
@@ -112,10 +161,11 @@ def empty_counts() -> dict[str, int]:
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    aliases, suppressions, calibrations = load_registry()
+    aliases, zones, suppressions, calibrations = load_registry()
 
     skipped_malformed_rows = 0
     skipped_suppressed_rows = 0
+    shifted_nonexistent_timestamps = 0
     valid_rows: list[tuple[str, str, float, str, datetime]] = []
 
     with INPUT_PATH.open(newline="", encoding="utf-8-sig") as f:
@@ -129,7 +179,8 @@ def main() -> None:
                 skipped_malformed_rows += 1
                 continue
 
-            instant = parse_instant(ts)
+            station_id = resolve_alias(sid_raw, aliases)
+            instant, shifted = parse_instant(ts, station_id, zones)
             if instant is None:
                 skipped_malformed_rows += 1
                 continue
@@ -143,7 +194,8 @@ def main() -> None:
                 skipped_malformed_rows += 1
                 continue
 
-            station_id = aliases.get(sid_raw, sid_raw)
+            if shifted:
+                shifted_nonexistent_timestamps += 1
             if is_suppressed(station_id, instant, suppressions):
                 skipped_suppressed_rows += 1
                 continue
@@ -182,6 +234,12 @@ def main() -> None:
             int((right[0] - left[0]).total_seconds() // 60)
             for left, right in zip(readings, readings[1:])
         ]
+        quality_runs = 0
+        previous_quality = None
+        for _instant, _temp, quality in readings:
+            if quality != previous_quality:
+                quality_runs += 1
+                previous_quality = quality
         stations.append(
             {
                 "station_id": station_id,
@@ -192,6 +250,7 @@ def main() -> None:
                 "avg_temperature_c": fmt_decimal(sum(temps) / len(temps)),
                 "quality_counts": counts,
                 "longest_gap_minutes": max(gaps) if gaps else None,
+                "quality_runs": quality_runs,
             }
         )
 
@@ -199,6 +258,7 @@ def main() -> None:
         "duplicate_rows_dropped": len(valid_rows) - len(deduped_rows),
         "skipped_malformed_rows": skipped_malformed_rows,
         "skipped_suppressed_rows": skipped_suppressed_rows,
+        "shifted_nonexistent_timestamps": shifted_nonexistent_timestamps,
         "deduped_row_count": len(deduped_rows),
         "station_count": len(by_station),
         "median_temperature_c_all": fmt_decimal(median_from_values(all_temps)),

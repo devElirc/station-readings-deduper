@@ -2,11 +2,25 @@
   "aliases": {
     "S-01": "S-1",
     "S-001": "S-1",
+    "S-LEGACY": "S-001",
     "N-07": "N-7",
     "N-007": "N-7",
     "harbor-east": "E-HBR",
     "W-OLD": "WEST-9",
-    "W-9": "WEST-9"
+    "W-9": "WEST-9",
+    "NYC-A": "NY-01",
+    "NYC-LEGACY": "NYC-A",
+    "CYCLE-A": "CYCLE-B",
+    "CYCLE-B": "CYCLE-A"
+  },
+  "station_timezones": {
+    "S-1": "UTC",
+    "N-7": "Europe/Berlin",
+    "E-HBR": "UTC",
+    "WEST-9": "America/Los_Angeles",
+    "solo": "UTC",
+    "NY-01": "America/New_York",
+    "CYCLE-A": "UTC"
   },
   "suppressions": [
     {
@@ -23,6 +37,11 @@
       "station_id": "WEST-9",
       "start": "2024-07-04T04:45:00+00:00",
       "end": "2024-07-04T05:15:00+00:00"
+    },
+    {
+      "station_id": "NY-01",
+      "start": "2024-11-03T06:20:00Z",
+      "end": "2024-11-03T06:40:00Z"
     }
   ],
   "calibrations": [
@@ -85,6 +104,24 @@
       "start": "2024-08-01T00:00:00Z",
       "end": "2024-08-01T01:00:00Z",
       "offset_c": -5.3
+    },
+    {
+      "station_id": "NY-01",
+      "start": "2024-03-10T07:00:00Z",
+      "end": "2024-03-10T08:00:00Z",
+      "offset_c": 2.25
+    },
+    {
+      "station_id": "NY-01",
+      "start": "2024-11-03T05:00:00Z",
+      "end": "2024-11-03T07:00:00Z",
+      "offset_c": -1.25
+    },
+    {
+      "station_id": "CYCLE-A",
+      "start": "2024-09-01T00:00:00Z",
+      "end": "2024-09-02T00:00:00Z",
+      "offset_c": 0.75
     }
   ]
 }
