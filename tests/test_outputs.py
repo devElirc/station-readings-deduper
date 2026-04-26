@@ -1,4 +1,4 @@
-"""Verify station CSV dedupe tool, subprocess execution, path policy, and outputs."""
+"""Verify registry-aware station CSV dedupe, path policy, and outputs."""
 
 import csv
 import json
@@ -11,13 +11,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 INPUT_CSV = Path("/app/inputs/station_readings.csv")
+REGISTRY_JSON = Path("/app/inputs/station_registry.json")
 SCRIPT_PATH = Path("/app/dedupe_report.py")
 DEDUPED_CSV = Path("/app/output/deduped.csv")
 STATS_JSON = Path("/app/output/stats.json")
+QUALITY_CODES = ("OK", "WARN", "EST")
 
 
 def _parse_instant(ts: str) -> datetime | None:
-    """Parse timestamp per instruction; None if malformed."""
+    """Parse timestamps exactly as the task specifies."""
     t = ts.strip()
     if not t:
         return None
@@ -28,128 +30,213 @@ def _parse_instant(ts: str) -> datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _fmt_decimal(x: float) -> str:
-    """One decimal place: round(x, 1) then str; -0.0 maps to 0.0."""
+    """Format one decimal after round(x, 1), mapping negative zero to 0.0."""
     r = round(x, 1)
     if r == 0:
         return "0.0"
     return str(r)
 
 
-def _median_from_sorted_values(vals: list[float]) -> float:
-    """Median: sort ascending; odd -> middle; even -> mean of two middles."""
-    s = sorted(vals)
-    n = len(s)
-    mid = n // 2
-    if n % 2:
-        return s[mid]
-    return (s[mid - 1] + s[mid]) / 2.0
+def _median_from_values(vals: list[float]) -> float:
+    """Return the median using sorted numeric values and even-count averaging."""
+    ordered = sorted(vals)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
-def _reference_from_input() -> tuple[list[tuple[str, str, float]], dict]:
-    """Recompute expected deduped rows and stats from the bundled CSV (utf-8-sig)."""
+def _load_registry() -> tuple[dict[str, str], list[dict], list[dict]]:
+    """Load aliases, suppression windows, and calibration windows."""
+    data = json.loads(REGISTRY_JSON.read_text())
+    aliases = {str(k).strip(): str(v).strip() for k, v in data["aliases"].items()}
+
+    suppressions = []
+    for item in data["suppressions"]:
+        suppressions.append(
+            {
+                "station_id": str(item["station_id"]).strip(),
+                "start": _parse_instant(str(item["start"])),
+                "end": _parse_instant(str(item["end"])),
+            }
+        )
+
+    calibrations = []
+    for index, item in enumerate(data["calibrations"]):
+        calibrations.append(
+            {
+                "station_id": str(item["station_id"]).strip(),
+                "start": _parse_instant(str(item["start"])),
+                "end": _parse_instant(str(item["end"])),
+                "offset_c": float(item["offset_c"]),
+                "index": index,
+            }
+        )
+    return aliases, suppressions, calibrations
+
+
+def _in_interval(instant: datetime, start: datetime, end: datetime) -> bool:
+    """Return whether instant is in a start-inclusive, end-exclusive interval."""
+    return start <= instant < end
+
+
+def _is_suppressed(station_id: str, instant: datetime, suppressions: list[dict]) -> bool:
+    """Return whether a station/instant falls inside any suppression window."""
+    return any(
+        item["station_id"] == station_id
+        and _in_interval(instant, item["start"], item["end"])
+        for item in suppressions
+    )
+
+
+def _calibrated_temperature(
+    station_id: str, instant: datetime, temp: float, calibrations: list[dict]
+) -> float:
+    """Apply the latest-start matching calibration, breaking ties by file order."""
+    matches = [
+        item
+        for item in calibrations
+        if item["station_id"] == station_id
+        and _in_interval(instant, item["start"], item["end"])
+    ]
+    if not matches:
+        return temp
+    chosen = max(matches, key=lambda item: (item["start"], item["index"]))
+    return temp + chosen["offset_c"]
+
+
+def _empty_counts() -> dict[str, int]:
+    """Create a zeroed OK/WARN/EST quality-count mapping."""
+    return {code: 0 for code in QUALITY_CODES}
+
+
+def _reference_from_input() -> tuple[list[tuple[str, str, float, str]], dict]:
+    """Recompute expected deduped rows and stats from CSV plus registry."""
+    aliases, suppressions, calibrations = _load_registry()
     skipped_malformed_rows = 0
-    rows_in_order: list[tuple[str, str, float, datetime]] = []
+    skipped_suppressed_rows = 0
+    valid_rows: list[tuple[str, str, float, str, datetime]] = []
+
     with INPUT_CSV.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            sid_raw = row.get("station_id")
-            ts_raw = row.get("timestamp")
-            tc_raw = row.get("temperature_c")
-            sid = (sid_raw or "").strip()
-            ts = (ts_raw or "").strip()
-            if not sid or not ts:
+            station_raw = (row.get("station_id") or "").strip()
+            ts = (row.get("timestamp") or "").strip()
+            temp_raw = (row.get("temperature_c") or "").strip()
+            quality = (row.get("quality_code") or "").strip()
+
+            if (
+                not station_raw
+                or not ts
+                or not temp_raw
+                or quality not in QUALITY_CODES
+            ):
                 skipped_malformed_rows += 1
                 continue
-            inst = _parse_instant(ts)
-            if inst is None:
+
+            instant = _parse_instant(ts)
+            if instant is None:
                 skipped_malformed_rows += 1
                 continue
-            if tc_raw is None or str(tc_raw).strip() == "":
-                skipped_malformed_rows += 1
-                continue
+
             try:
-                temp = float(str(tc_raw).strip())
+                temp = float(temp_raw)
             except ValueError:
                 skipped_malformed_rows += 1
                 continue
             if not math.isfinite(temp):
                 skipped_malformed_rows += 1
                 continue
-            rows_in_order.append((sid, ts, temp, inst))
 
-    total_in = len(rows_in_order)
-    last_win: dict[tuple[str, datetime], tuple[str, str, float]] = {}
-    for sid, ts, temp, inst in rows_in_order:
-        last_win[(sid, inst)] = (sid, ts, temp)
+            station_id = aliases.get(station_raw, station_raw)
+            if _is_suppressed(station_id, instant, suppressions):
+                skipped_suppressed_rows += 1
+                continue
 
-    dropped = total_in - len(last_win)
+            temp = _calibrated_temperature(station_id, instant, temp, calibrations)
+            valid_rows.append((station_id, ts, temp, quality, instant))
+
+    last_win: dict[tuple[str, datetime], tuple[str, str, float, str, datetime]] = {}
+    for station_id, ts, temp, quality, instant in valid_rows:
+        last_win[(station_id, instant)] = (station_id, ts, temp, quality, instant)
+
     deduped = list(last_win.values())
-    deduped.sort(key=lambda r: (r[0], _parse_instant(r[1]) or datetime.min.replace(tzinfo=timezone.utc)))
+    deduped.sort(key=lambda row: (row[0], row[4]))
 
-    by_station: dict[str, list[float]] = {}
-    for sid, _ts, temp in deduped:
-        by_station.setdefault(sid, []).append(temp)
-
-    all_temps = [temp for _sid, _ts, temp in deduped]
-    median_all = _median_from_sorted_values(all_temps)
+    by_station: dict[str, list[tuple[datetime, float, str]]] = {}
+    global_counts = _empty_counts()
+    for station_id, _ts, temp, quality, instant in deduped:
+        by_station.setdefault(station_id, []).append((instant, temp, quality))
+        global_counts[quality] += 1
 
     stations = []
-    for sid in sorted(by_station.keys()):
-        temps = by_station[sid]
-        mean = sum(temps) / len(temps)
-        med = _median_from_sorted_values(temps)
+    for station_id in sorted(by_station):
+        readings = sorted(by_station[station_id], key=lambda row: row[0])
+        temps = [temp for _instant, temp, _quality in readings]
+        counts = _empty_counts()
+        for _instant, _temp, quality in readings:
+            counts[quality] += 1
+        gaps = [
+            int((right[0] - left[0]).total_seconds() // 60)
+            for left, right in zip(readings, readings[1:])
+        ]
         stations.append(
             {
-                "station_id": sid,
-                "readings": len(temps),
+                "station_id": station_id,
+                "readings": len(readings),
                 "min_temperature_c": _fmt_decimal(min(temps)),
                 "max_temperature_c": _fmt_decimal(max(temps)),
-                "median_temperature_c": _fmt_decimal(med),
-                "avg_temperature_c": _fmt_decimal(mean),
+                "median_temperature_c": _fmt_decimal(_median_from_values(temps)),
+                "avg_temperature_c": _fmt_decimal(sum(temps) / len(temps)),
+                "quality_counts": counts,
+                "longest_gap_minutes": max(gaps) if gaps else None,
             }
         )
 
+    all_temps = [temp for _station_id, _ts, temp, _quality, _instant in deduped]
     stats = {
-        "duplicate_rows_dropped": dropped,
+        "duplicate_rows_dropped": len(valid_rows) - len(deduped),
         "skipped_malformed_rows": skipped_malformed_rows,
+        "skipped_suppressed_rows": skipped_suppressed_rows,
         "deduped_row_count": len(deduped),
         "station_count": len(by_station),
-        "median_temperature_c_all": _fmt_decimal(median_all),
+        "median_temperature_c_all": _fmt_decimal(_median_from_values(all_temps)),
+        "global_quality_counts": global_counts,
         "stations": stations,
     }
-    out_rows = [(sid, ts, temp) for sid, ts, temp in deduped]
+    out_rows = [(station_id, ts, temp, quality) for station_id, ts, temp, quality, _ in deduped]
     return out_rows, stats
 
 
-def _assert_csv_matches(expected_rows: list[tuple[str, str, float]]) -> None:
-    """Assert deduped.csv content matches expected row tuples."""
+def _assert_csv_matches(expected_rows: list[tuple[str, str, float, str]]) -> None:
+    """Assert deduped.csv rows preserve winning timestamp and adjusted temperature."""
     with DEDUPED_CSV.open(newline="") as f:
         reader = csv.DictReader(f)
         assert reader.fieldnames == [
             "timestamp",
             "station_id",
             "temperature_c",
+            "quality_code",
         ], "Unexpected CSV header"
         actual = [
             (
                 row["station_id"].strip(),
                 row["timestamp"].strip(),
                 float(row["temperature_c"]),
+                row["quality_code"].strip(),
             )
             for row in reader
         ]
-    assert actual == expected_rows, "deduped.csv does not match expected dedupe"
+    assert actual == expected_rows, "deduped.csv does not match expected registry dedupe"
 
 
 def _assert_stats_matches(expected_stats: dict) -> None:
-    """Assert stats.json matches expected dict."""
+    """Assert stats.json exactly matches registry-aware recomputation."""
     data = json.loads(STATS_JSON.read_text())
     assert data == expected_stats, f"stats mismatch: {data!r} vs {expected_stats!r}"
 
@@ -184,9 +271,9 @@ def test_script_compiles():
 
 
 def test_script_rebuild_under_strace_respects_app_paths():
-    """Run a clean rebuild under strace; only allowed /app paths may be opened."""
+    """Run a clean rebuild under strace; only allowed /app inputs may be opened."""
     if shutil.which("strace") is None:
-        raise AssertionError("strace must be installed in the verifier image (tests/test.sh)")
+        raise AssertionError("strace must be installed in the verifier image")
 
     shutil.rmtree("/app/output", ignore_errors=True)
     log_path = Path("/tmp/dedupe_strace.log")
@@ -194,14 +281,7 @@ def test_script_rebuild_under_strace_respects_app_paths():
         log_path.unlink()
 
     proc = subprocess.run(
-        [
-            "strace",
-            "-f",
-            "-o",
-            str(log_path),
-            "python3",
-            str(SCRIPT_PATH),
-        ],
+        ["strace", "-f", "-o", str(log_path), "python3", str(SCRIPT_PATH)],
         capture_output=True,
         text=True,
         timeout=120,
@@ -212,26 +292,27 @@ def test_script_rebuild_under_strace_respects_app_paths():
 
     log_text = log_path.read_text(errors="replace")
     paths: set[str] = set()
-    for m in re.finditer(r'openat64?\([^"]*,\s*"([^"]+)"', log_text):
-        paths.add(m.group(1))
-    for m in re.finditer(r'open\("([^"]+)"', log_text):
-        paths.add(m.group(1))
+    for match in re.finditer(r'openat64?\([^"]*,\s*"([^"]+)"', log_text):
+        paths.add(match.group(1))
+    for match in re.finditer(r'open\("([^"]+)"', log_text):
+        paths.add(match.group(1))
 
-    for p in sorted(paths):
-        assert "ground_truth_hint" not in p, f"Must not open hint decoy paths: {p!r}"
-        if not p.startswith("/app/"):
+    for path in sorted(paths):
+        assert "canary_decoy" not in path, f"Must not open decoy paths: {path!r}"
+        if not path.startswith("/app/"):
             continue
         ok = (
-            p == "/app/dedupe_report.py"
-            or p == "/app/inputs/station_readings.csv"
-            or p.startswith("/app/__pycache__/")
-            or p.startswith("/app/output/")
+            path == "/app/dedupe_report.py"
+            or path == "/app/inputs/station_readings.csv"
+            or path == "/app/inputs/station_registry.json"
+            or path.startswith("/app/__pycache__/")
+            or path.startswith("/app/output/")
         )
-        assert ok, f"Disallowed open under /app (instruction forbids extra input reads): {p!r}"
+        assert ok, f"Disallowed open under /app: {path!r}"
 
 
 def test_script_rebuild_matches_reference():
-    """Deleting /app/output and running the script must reproduce correct outputs."""
+    """Deleting /app/output and running the script must reproduce both outputs."""
     shutil.rmtree("/app/output", ignore_errors=True)
     proc = subprocess.run(
         ["python3", str(SCRIPT_PATH)],
@@ -249,13 +330,13 @@ def test_script_rebuild_matches_reference():
 
 
 def test_deduped_csv_matches_reference():
-    """Verify deduped rows; station_id lex sort then UTC instant chronological order."""
+    """Verify aliasing, suppression, calibration, last-wins dedupe, and sort order."""
     expected_rows, _ = _reference_from_input()
     _assert_csv_matches(expected_rows)
 
 
 def test_stats_json_matches_reference():
-    """Verify stats.json fields match recomputation from the input CSV."""
+    """Verify stats fields, quality counts, medians, averages, and longest gaps."""
     _, expected_stats = _reference_from_input()
     _assert_stats_matches(expected_stats)
 
@@ -266,16 +347,24 @@ def test_stats_schema():
     assert set(data.keys()) == {
         "duplicate_rows_dropped",
         "skipped_malformed_rows",
+        "skipped_suppressed_rows",
         "deduped_row_count",
         "station_count",
         "median_temperature_c_all",
+        "global_quality_counts",
         "stations",
     }
-    assert isinstance(data["duplicate_rows_dropped"], int)
-    assert isinstance(data["skipped_malformed_rows"], int)
-    assert isinstance(data["deduped_row_count"], int)
-    assert isinstance(data["station_count"], int)
+    for key in (
+        "duplicate_rows_dropped",
+        "skipped_malformed_rows",
+        "skipped_suppressed_rows",
+        "deduped_row_count",
+        "station_count",
+    ):
+        assert isinstance(data[key], int)
     assert isinstance(data["median_temperature_c_all"], str)
+    assert set(data["global_quality_counts"]) == set(QUALITY_CODES)
+    assert all(isinstance(value, int) for value in data["global_quality_counts"].values())
     assert isinstance(data["stations"], list)
     for entry in data["stations"]:
         assert set(entry.keys()) == {
@@ -285,12 +374,19 @@ def test_stats_schema():
             "max_temperature_c",
             "median_temperature_c",
             "avg_temperature_c",
+            "quality_counts",
+            "longest_gap_minutes",
         }
         assert isinstance(entry["readings"], int)
-        for k in (
+        assert set(entry["quality_counts"]) == set(QUALITY_CODES)
+        assert all(isinstance(value, int) for value in entry["quality_counts"].values())
+        assert entry["longest_gap_minutes"] is None or isinstance(
+            entry["longest_gap_minutes"], int
+        )
+        for key in (
             "min_temperature_c",
             "max_temperature_c",
             "median_temperature_c",
             "avg_temperature_c",
         ):
-            assert isinstance(entry[k], str)
+            assert isinstance(entry[key], str)

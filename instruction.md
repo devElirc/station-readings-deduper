@@ -1,28 +1,7 @@
-Duplicate weather station rows live in /app/inputs/station_readings.csv. 
-The file is UTF-8 and may begin with a UTF-8 BOM; the header row is timestamp, station_id, temperature_c. 
-Temperatures are Celsius as decimals.
+The station readings job in /app started double-counting data after the station registry changed. Please add an executable Python 3 script at /app/dedupe_report.py with #!/usr/bin/env python3. It should read only /app/inputs/station_readings.csv and /app/inputs/station_registry.json, create /app/output if needed, and write /app/output/deduped.csv plus /app/output/stats.json.
 
-Implement a Python 3 program at /app/dedupe_report.py (include #!/usr/bin/env python3 and make it executable). 
-It must read input only from /app/inputs/station_readings.csv (no other path may be opened for reading under /app except the script file itself and whatever Python creates under /app/__pycache__ if applicable). 
-Skip any data row where station_id or timestamp is empty after stripping surrounding ASCII whitespace, or temperature_c is missing/blank/whitespace-only, or temperature_c parses with float() but is not finite (reject nan and infinities), or the timestamp cannot be interpreted as specified below; count all such skips in skipped_malformed_rows (integer). 
-Only non-skipped rows participate in dedupe.
+The readings CSV may have a UTF-8 BOM and has these columns: timestamp, station_id, temperature_c, quality_code. Strip surrounding ASCII whitespace from every field. Treat a row as malformed when timestamp or station_id is empty, temperature_c is blank or not a finite float, quality_code is not one of OK/WARN/EST, or the timestamp cannot be parsed. For timestamps, turn a trailing uppercase Z into +00:00, use datetime.fromisoformat, treat naive values as UTC, and convert aware values to UTC. Canonicalize the stripped station id through the registry aliases; ids not listed there stay unchanged. If the canonical station has a suppression window covering the UTC instant, skip the row and count it in skipped_suppressed_rows instead of skipped_malformed_rows.
 
-Timestamp interpretation (must match exactly): take the timestamp field after strip. 
-If it ends with an ASCII uppercase Z only, replace that suffix with +00:00 before parsing. 
-Parse with datetime.fromisoformat from the Python standard library. 
-If the result has no timezone, treat the wall time as UTC. 
-Otherwise convert to UTC with astimezone. 
-Any ValueError from fromisoformat counts as malformed. 
-The dedupe key is (station_id.strip(), utc_instant) where utc_instant is that UTC-aware datetime. 
-When two rows share the same key, keep the last row in file order; the written timestamp and station_id columns are the stripped strings from that winning row (temperature is its float value). 
-Write /app/output/deduped.csv with columns timestamp, station_id, temperature_c and no duplicate keys. 
-Sort rows by station_id ascending using Python’s default string ordering on the written station_id, then by utc_instant chronological ascending (not lexicographic on timestamp strings).
+Apply calibration after suppression and before deduping. Calibration windows are UTC intervals with inclusive starts and exclusive ends. Add the matching offset_c to the temperature; when more than one window matches, use the one with the latest start, and if that still ties, use the later entry in the registry file. Dedupe by (canonical station_id, UTC instant), with the last non-skipped row in file order winning. In /app/output/deduped.csv, write timestamp, station_id, temperature_c, quality_code. Preserve the winning row's stripped timestamp string, write the canonical station id, write the calibrated float using str(), and sort rows by station_id with Python's default string order, then by UTC instant.
 
-Also write /app/output/stats.json as a JSON object with: duplicate_rows_dropped (non-skipped input rows minus distinct dedupe keys after last-wins), skipped_malformed_rows, deduped_row_count, station_count, median_temperature_c_all (string: median of every retained temperature after dedupe, pooling all stations), and stations (array sorted by station_id ascending on the written ids). 
-Each station entry is {"station_id": "<id>", "readings": <int>, "min_temperature_c": "<string>", "max_temperature_c": "<string>", "median_temperature_c": "<string>", "avg_temperature_c": "<string>"} from that station’s retained temperatures after dedupe. 
-To calculate the median, sort the numbers from smallest to largest.
-If there is an odd number of values, use the middle one.
-If there is an even number of values, use the average of the two middle values.
-Format min, max, median, and avg with exactly one digit after the decimal using Python round(x, 1) then str, mapping -0.0 to "0.0" if it appears.
-
-Create /app/output if it is missing.
+For /app/output/stats.json, include duplicate_rows_dropped, skipped_malformed_rows, skipped_suppressed_rows, deduped_row_count, station_count, median_temperature_c_all, global_quality_counts, and stations. Quality count objects must have exactly OK, WARN, and EST integer keys. The stations array should be sorted by station_id; each entry needs station_id, readings, min_temperature_c, max_temperature_c, median_temperature_c, avg_temperature_c, quality_counts, and longest_gap_minutes. Longest gap is the largest whole-minute gap between consecutive retained UTC instants for that station, or null when there is only one reading. For medians, sort the numeric temperatures and average the two middle values for even counts. Format min, max, median, avg, and median_temperature_c_all with round(x, 1) then str(), but report -0.0 as "0.0".

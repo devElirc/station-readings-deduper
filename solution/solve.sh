@@ -5,7 +5,7 @@ mkdir -p /app/output
 
 cat > /app/dedupe_report.py << 'PY'
 #!/usr/bin/env python3
-"""Dedupe station readings: UTC instant key, last row wins."""
+"""Build deduped station readings and registry-aware station statistics."""
 
 import csv
 import json
@@ -14,9 +14,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 INPUT_PATH = Path("/app/inputs/station_readings.csv")
+REGISTRY_PATH = Path("/app/inputs/station_registry.json")
 OUTPUT_DIR = Path("/app/output")
 DEDUPED_PATH = OUTPUT_DIR / "deduped.csv"
 STATS_PATH = OUTPUT_DIR / "stats.json"
+QUALITY_CODES = ("OK", "WARN", "EST")
 
 
 def parse_instant(ts: str) -> datetime | None:
@@ -30,10 +32,8 @@ def parse_instant(ts: str) -> datetime | None:
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def fmt_decimal(x: float) -> str:
@@ -43,97 +43,166 @@ def fmt_decimal(x: float) -> str:
     return str(r)
 
 
-def median_from_sorted_values(vals: list[float]) -> float:
-    s = sorted(vals)
-    n = len(s)
-    mid = n // 2
-    if n % 2:
-        return s[mid]
-    return (s[mid - 1] + s[mid]) / 2.0
+def median_from_values(vals: list[float]) -> float:
+    ordered = sorted(vals)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def load_registry() -> tuple[dict[str, str], list[dict], list[dict]]:
+    data = json.loads(REGISTRY_PATH.read_text())
+    aliases = {str(k).strip(): str(v).strip() for k, v in data["aliases"].items()}
+
+    suppressions = []
+    for item in data["suppressions"]:
+        suppressions.append(
+            {
+                "station_id": str(item["station_id"]).strip(),
+                "start": parse_instant(str(item["start"])),
+                "end": parse_instant(str(item["end"])),
+            }
+        )
+
+    calibrations = []
+    for idx, item in enumerate(data["calibrations"]):
+        calibrations.append(
+            {
+                "station_id": str(item["station_id"]).strip(),
+                "start": parse_instant(str(item["start"])),
+                "end": parse_instant(str(item["end"])),
+                "offset_c": float(item["offset_c"]),
+                "index": idx,
+            }
+        )
+    return aliases, suppressions, calibrations
+
+
+def in_interval(instant: datetime, start: datetime, end: datetime) -> bool:
+    return start <= instant < end
+
+
+def is_suppressed(station_id: str, instant: datetime, suppressions: list[dict]) -> bool:
+    return any(
+        item["station_id"] == station_id
+        and in_interval(instant, item["start"], item["end"])
+        for item in suppressions
+    )
+
+
+def calibrated_temperature(
+    station_id: str, instant: datetime, temp: float, calibrations: list[dict]
+) -> float:
+    matches = [
+        item
+        for item in calibrations
+        if item["station_id"] == station_id
+        and in_interval(instant, item["start"], item["end"])
+    ]
+    if not matches:
+        return temp
+    chosen = max(matches, key=lambda item: (item["start"], item["index"]))
+    return temp + chosen["offset_c"]
+
+
+def empty_counts() -> dict[str, int]:
+    return {code: 0 for code in QUALITY_CODES}
 
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    aliases, suppressions, calibrations = load_registry()
 
     skipped_malformed_rows = 0
-    rows_in_order: list[tuple[str, str, float, datetime]] = []
+    skipped_suppressed_rows = 0
+    valid_rows: list[tuple[str, str, float, str, datetime]] = []
+
     with INPUT_PATH.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            sid = (row.get("station_id") or "").strip()
+            sid_raw = (row.get("station_id") or "").strip()
             ts = (row.get("timestamp") or "").strip()
-            tc_raw = row.get("temperature_c")
-            if not sid or not ts:
+            temp_raw = (row.get("temperature_c") or "").strip()
+            quality = (row.get("quality_code") or "").strip()
+            if not sid_raw or not ts or not temp_raw or quality not in QUALITY_CODES:
                 skipped_malformed_rows += 1
                 continue
-            inst = parse_instant(ts)
-            if inst is None:
+
+            instant = parse_instant(ts)
+            if instant is None:
                 skipped_malformed_rows += 1
                 continue
-            if tc_raw is None or str(tc_raw).strip() == "":
-                skipped_malformed_rows += 1
-                continue
+
             try:
-                temp = float(str(tc_raw).strip())
+                temp = float(temp_raw)
             except ValueError:
                 skipped_malformed_rows += 1
                 continue
             if not math.isfinite(temp):
                 skipped_malformed_rows += 1
                 continue
-            rows_in_order.append((sid, ts, temp, inst))
 
-    total_in = len(rows_in_order)
-    last_win: dict[tuple[str, datetime], tuple[str, str, float]] = {}
-    for sid, ts, temp, inst in rows_in_order:
-        last_win[(sid, inst)] = (sid, ts, temp)
+            station_id = aliases.get(sid_raw, sid_raw)
+            if is_suppressed(station_id, instant, suppressions):
+                skipped_suppressed_rows += 1
+                continue
 
-    duplicate_rows_dropped = total_in - len(last_win)
-    deduped_row_count = len(last_win)
+            temp = calibrated_temperature(station_id, instant, temp, calibrations)
+            valid_rows.append((station_id, ts, temp, quality, instant))
+
+    last_win: dict[tuple[str, datetime], tuple[str, str, float, str, datetime]] = {}
+    for station_id, ts, temp, quality, instant in valid_rows:
+        last_win[(station_id, instant)] = (station_id, ts, temp, quality, instant)
 
     deduped_rows = list(last_win.values())
-    deduped_rows.sort(
-        key=lambda r: (
-            r[0],
-            parse_instant(r[1]) or datetime.min.replace(tzinfo=timezone.utc),
-        )
-    )
+    deduped_rows.sort(key=lambda r: (r[0], r[4]))
 
     with DEDUPED_PATH.open("w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["timestamp", "station_id", "temperature_c"])
-        for sid, ts, temp in deduped_rows:
-            w.writerow([ts, sid, temp])
+        writer = csv.writer(f)
+        writer.writerow(["timestamp", "station_id", "temperature_c", "quality_code"])
+        for station_id, ts, temp, quality, _instant in deduped_rows:
+            writer.writerow([ts, station_id, str(temp), quality])
 
-    by_station: dict[str, list[float]] = {}
-    for sid, _ts, temp in deduped_rows:
-        by_station.setdefault(sid, []).append(temp)
+    by_station: dict[str, list[tuple[datetime, float, str]]] = {}
+    global_counts = empty_counts()
+    for station_id, _ts, temp, quality, instant in deduped_rows:
+        by_station.setdefault(station_id, []).append((instant, temp, quality))
+        global_counts[quality] += 1
 
-    all_temps = [temp for _sid, _ts, temp in deduped_rows]
-    median_all = median_from_sorted_values(all_temps)
-
+    all_temps = [temp for _station_id, _ts, temp, _quality, _instant in deduped_rows]
     stations = []
-    for sid in sorted(by_station.keys()):
-        temps = by_station[sid]
-        mean = sum(temps) / len(temps)
-        med = median_from_sorted_values(temps)
+    for station_id in sorted(by_station):
+        readings = sorted(by_station[station_id], key=lambda r: r[0])
+        temps = [temp for _instant, temp, _quality in readings]
+        counts = empty_counts()
+        for _instant, _temp, quality in readings:
+            counts[quality] += 1
+        gaps = [
+            int((right[0] - left[0]).total_seconds() // 60)
+            for left, right in zip(readings, readings[1:])
+        ]
         stations.append(
             {
-                "station_id": sid,
-                "readings": len(temps),
+                "station_id": station_id,
+                "readings": len(readings),
                 "min_temperature_c": fmt_decimal(min(temps)),
                 "max_temperature_c": fmt_decimal(max(temps)),
-                "median_temperature_c": fmt_decimal(med),
-                "avg_temperature_c": fmt_decimal(mean),
+                "median_temperature_c": fmt_decimal(median_from_values(temps)),
+                "avg_temperature_c": fmt_decimal(sum(temps) / len(temps)),
+                "quality_counts": counts,
+                "longest_gap_minutes": max(gaps) if gaps else None,
             }
         )
 
     stats = {
-        "duplicate_rows_dropped": duplicate_rows_dropped,
+        "duplicate_rows_dropped": len(valid_rows) - len(deduped_rows),
         "skipped_malformed_rows": skipped_malformed_rows,
-        "deduped_row_count": deduped_row_count,
+        "skipped_suppressed_rows": skipped_suppressed_rows,
+        "deduped_row_count": len(deduped_rows),
         "station_count": len(by_station),
-        "median_temperature_c_all": fmt_decimal(median_all),
+        "median_temperature_c_all": fmt_decimal(median_from_values(all_temps)),
+        "global_quality_counts": global_counts,
         "stations": stations,
     }
     STATS_PATH.write_text(json.dumps(stats, indent=2) + "\n")

@@ -1,0 +1,2 @@
+timestamp,station_id,temperature_c,quality_code
+2099-01-01T00:00:00Z,FAKE,999.9,OK
