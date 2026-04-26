@@ -18,6 +18,56 @@ DEDUPED_CSV = Path("/app/output/deduped.csv")
 STATS_JSON = Path("/app/output/stats.json")
 QUALITY_CODES = ("OK", "WARN", "EST")
 
+# CWD for subprocess runs of /app/dedupe_report.py so strace resolves relative paths
+# against /app (prevents quietly opening harness files via relative paths).
+DEDUPE_SCRIPT_CWD = "/app"
+
+# Anti-cheat: benchmark / verifier trees the agent script must never read.
+_STRACE_FORBIDDEN_PREFIXES = ("/tests", "/oracle", "/solution", "/logs")
+
+# Outside /app, only normal OS/CPython paths are allowed (Debian slim + strace).
+_STRACE_ALLOWED_NON_APP_PREFIXES = (
+    "/usr/",
+    "/lib/",
+    "/lib64/",
+    "/bin/",
+    "/sbin/",
+    "/etc/",
+    "/dev/",
+    "/proc/",
+    "/sys/",
+    "/run/",
+    "/tmp/",
+)
+
+
+def _strace_collect_path_arguments(log_text: str) -> set[str]:
+    """Extract pathname arguments from common strace file-related syscalls."""
+    paths: set[str] = set()
+    patterns = (
+        r'openat64?\([^"]*,\s*"([^"]+)"',
+        r'open\("([^"]+)"',
+        r'newfstatat\([^,]+,\s*"([^"]+)"',
+        r'stat\("([^"]+)"',
+        r'statx\([^,]+,\s*"([^"]+)"',
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, log_text):
+            paths.add(match.group(1))
+    return paths
+
+
+def _normalize_traced_path(raw: str, cwd: str) -> str:
+    """Normalize a strace path; resolve relative paths against the traced process cwd."""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if " (deleted)" in s:
+        s = s.split(" (deleted)", 1)[0]
+    if s.startswith("/"):
+        return os.path.normpath(s)
+    return os.path.normpath(os.path.join(cwd, s))
+
 
 def _localize_naive(naive: datetime, zone_name: str) -> tuple[datetime, bool]:
     """Interpret a naive wall time, choosing later ambiguous instants and shifting gaps."""
@@ -333,7 +383,7 @@ def test_script_compiles():
 
 
 def test_script_rebuild_under_strace_respects_app_paths():
-    """Run a clean rebuild under strace; only allowed /app inputs may be opened."""
+    """Run a clean rebuild under strace; forbid harness paths; only allowed /app opens."""
     if shutil.which("strace") is None:
         raise AssertionError("strace must be installed in the verifier image")
 
@@ -347,30 +397,45 @@ def test_script_rebuild_under_strace_respects_app_paths():
         capture_output=True,
         text=True,
         timeout=120,
+        cwd=DEDUPE_SCRIPT_CWD,
     )
     assert proc.returncode == 0, (proc.stderr, proc.stdout)
     assert DEDUPED_CSV.is_file(), "Script did not create /app/output/deduped.csv"
     assert STATS_JSON.is_file(), "Script did not create /app/output/stats.json"
 
     log_text = log_path.read_text(errors="replace")
-    paths: set[str] = set()
-    for match in re.finditer(r'openat64?\([^"]*,\s*"([^"]+)"', log_text):
-        paths.add(match.group(1))
-    for match in re.finditer(r'open\("([^"]+)"', log_text):
-        paths.add(match.group(1))
+    raw_paths = _strace_collect_path_arguments(log_text)
 
-    for path in sorted(paths):
-        assert "canary_decoy" not in path, f"Must not open decoy paths: {path!r}"
-        if not path.startswith("/app/"):
+    for raw in sorted(raw_paths):
+        norm = _normalize_traced_path(raw, DEDUPE_SCRIPT_CWD)
+        if not norm or norm == ".":
             continue
-        ok = (
-            path == "/app/dedupe_report.py"
-            or path == "/app/inputs/station_readings.csv"
-            or path == "/app/inputs/station_registry.json"
-            or path.startswith("/app/__pycache__/")
-            or path.startswith("/app/output/")
-        )
-        assert ok, f"Disallowed open under /app: {path!r}"
+        assert "canary_decoy" not in norm, f"Must not open decoy paths: {raw!r}"
+        for root in _STRACE_FORBIDDEN_PREFIXES:
+            assert not (norm == root or norm.startswith(root + "/")), (
+                f"Must not open benchmark harness paths under {root!r}: {raw!r} "
+                f"(normalized: {norm!r})"
+            )
+        under_app = norm.startswith("/app/") or norm == "/app"
+        if under_app:
+            ok = (
+                norm == "/app"
+                or norm == "/app/dedupe_report.py"
+                or norm == "/app/inputs/station_readings.csv"
+                or norm == "/app/inputs/station_registry.json"
+                or norm.startswith("/app/__pycache__/")
+                or norm.startswith("/app/output/")
+            )
+            assert ok, f"Disallowed open under /app: {raw!r} (normalized: {norm!r})"
+        else:
+            allowed_non_app = any(
+                norm == p.rstrip("/") or norm.startswith(p)
+                for p in _STRACE_ALLOWED_NON_APP_PREFIXES
+            )
+            assert allowed_non_app, (
+                f"Disallowed access outside /app (possible harness leak): {raw!r} "
+                f"-> {norm!r}"
+            )
 
 
 def test_script_rebuild_matches_reference():
@@ -381,6 +446,7 @@ def test_script_rebuild_matches_reference():
         capture_output=True,
         text=True,
         timeout=120,
+        cwd=DEDUPE_SCRIPT_CWD,
     )
     assert proc.returncode == 0, proc.stderr
     assert DEDUPED_CSV.is_file()
