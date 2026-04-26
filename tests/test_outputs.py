@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 INPUT_CSV = Path("/app/inputs/station_readings.csv")
 REGISTRY_JSON = Path("/app/inputs/station_registry.json")
 SCRIPT_PATH = Path("/app/dedupe_report.py")
@@ -43,12 +45,34 @@ _STRACE_ALLOWED_NON_APP_PREFIXES = (
 )
 
 
+@pytest.fixture(scope="module", autouse=True)
+def ensure_output_artifacts():
+    """Rebuild /app/output if missing so file-only tests work under pytest -k."""
+    if DEDUPED_CSV.is_file() and STATS_JSON.is_file():
+        return
+    if not SCRIPT_PATH.is_file():
+        return
+    DEDUPED_CSV.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.run(
+        ["python3", str(SCRIPT_PATH)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=DEDUPE_SCRIPT_CWD,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert DEDUPED_CSV.is_file() and STATS_JSON.is_file(), (
+        "expected /app/dedupe_report.py to write /app/output/deduped.csv and stats.json"
+    )
+
+
 def _strace_collect_path_arguments(log_text: str) -> set[str]:
     """Extract pathname arguments from common strace file-related syscalls."""
     paths: set[str] = set()
     patterns = (
-        r'openat64?\([^"]*,\s*"([^"]+)"',
-        r'open\("([^"]+)"',
+        r'openat(?:64)?\([^"]*,\s*"([^"]+)"',
+        r'openat2\([^"]*,\s*"([^"]+)"',
+        r'(?<![a-z])open\("([^"]+)"',
         r'newfstatat\([^,]+,\s*"([^"]+)"',
         r'stat\("([^"]+)"',
         r'statx\([^,]+,\s*"([^"]+)"',
