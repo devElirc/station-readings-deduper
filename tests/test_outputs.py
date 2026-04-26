@@ -38,6 +38,8 @@ _STRACE_ALLOWED_NON_APP_PREFIXES = (
     "/sys/",
     "/run/",
     "/tmp/",
+    # CPython as uid 0 probes $HOME (/root) on Debian slim images.
+    "/root/",
 )
 
 
