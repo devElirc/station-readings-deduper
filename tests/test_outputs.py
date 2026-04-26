@@ -242,8 +242,8 @@ def _empty_counts() -> dict[str, int]:
     return {code: 0 for code in QUALITY_CODES}
 
 
-def _reference_from_input() -> tuple[list[tuple[str, str, float, str]], dict]:
-    """Recompute expected deduped rows and stats from CSV plus registry."""
+def _reference_from_input() -> tuple[list[tuple[str, str, str, str]], dict]:
+    """Recompute expected deduped rows (one-decimal temp strings) and stats from CSV plus registry."""
     aliases, zones, suppressions, calibrations = _load_registry()
     skipped_malformed_rows = 0
     skipped_suppressed_rows = 0
@@ -347,12 +347,15 @@ def _reference_from_input() -> tuple[list[tuple[str, str, float, str]], dict]:
         "global_quality_counts": global_counts,
         "stations": stations,
     }
-    out_rows = [(station_id, ts, temp, quality) for station_id, ts, temp, quality, _ in deduped]
+    out_rows = [
+        (station_id, ts, _fmt_decimal(temp), quality)
+        for station_id, ts, temp, quality, _ in deduped
+    ]
     return out_rows, stats
 
 
-def _assert_csv_matches(expected_rows: list[tuple[str, str, float, str]]) -> None:
-    """Assert deduped.csv rows preserve winning timestamp and adjusted temperature."""
+def _assert_csv_matches(expected_rows: list[tuple[str, str, str, str]]) -> None:
+    """Assert deduped.csv rows preserve winning timestamp and one-decimal temperature text."""
     with DEDUPED_CSV.open(newline="") as f:
         reader = csv.DictReader(f)
         assert reader.fieldnames == [
@@ -365,7 +368,7 @@ def _assert_csv_matches(expected_rows: list[tuple[str, str, float, str]]) -> Non
             (
                 row["station_id"].strip(),
                 row["timestamp"].strip(),
-                float(row["temperature_c"]),
+                row["temperature_c"].strip(),
                 row["quality_code"].strip(),
             )
             for row in reader

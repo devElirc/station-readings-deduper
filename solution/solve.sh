@@ -214,7 +214,7 @@ def main() -> None:
         writer = csv.writer(f)
         writer.writerow(["timestamp", "station_id", "temperature_c", "quality_code"])
         for station_id, ts, temp, quality, _instant in deduped_rows:
-            writer.writerow([ts, station_id, str(temp), quality])
+            writer.writerow([ts, station_id, fmt_decimal(temp), quality])
 
     by_station: dict[str, list[tuple[datetime, float, str]]] = {}
     global_counts = empty_counts()
