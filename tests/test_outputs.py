@@ -5,6 +5,7 @@ import json
 import math
 import os
 import re
+import random
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -551,3 +552,105 @@ def test_stats_schema():
             "avg_temperature_c",
         ):
             assert isinstance(entry[key], str)
+
+
+def test_randomized_inputs_match_reference():
+    """Extra adversarial cases to prevent overfitting the bundled fixtures."""
+    original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
+    original_registry = REGISTRY_JSON.read_text(encoding="utf-8")
+    try:
+        for seed in range(20):
+            rng = random.Random(880_000 + seed)
+
+            # Always include NY timezone so DST gap/overlap behavior is exercised.
+            zones = {"NY-01": "America/New_York", "UTC-01": "UTC"}
+
+            # Aliases: include a small chain and a 3-cycle.
+            aliases = {
+                "NY-A": "NY-01",
+                "NY-B": "NY-A",
+                "CYC-1": "CYC-2",
+                "CYC-2": "CYC-3",
+                "CYC-3": "CYC-1",
+            }
+
+            # Suppress NY around the shifted time after the spring-forward gap.
+            suppressions = [
+                {
+                    "station_id": "NY-01",
+                    "start": "2024-03-10T07:16:00Z",
+                    "end": "2024-03-10T07:20:00Z",
+                }
+            ]
+
+            # Two overlapping calibration windows to enforce tie-breaking.
+            calibrations = [
+                {
+                    "station_id": "NY-01",
+                    "start": "2024-03-10T07:00:00Z",
+                    "end": "2024-03-10T08:00:00Z",
+                    "offset_c": 0.5,
+                },
+                {
+                    "station_id": "NY-01",
+                    "start": "2024-03-10T07:30:00Z",
+                    "end": "2024-03-10T08:00:00Z",
+                    "offset_c": -0.25,
+                },
+            ]
+
+            registry = {
+                "aliases": aliases,
+                "station_timezones": zones,
+                "suppressions": suppressions,
+                "calibrations": calibrations,
+            }
+            REGISTRY_JSON.write_text(json.dumps(registry), encoding="utf-8")
+
+            # Build a CSV with malformed lines, alias chains, last-wins dedupe, and DST edge cases.
+            lines = [
+                "timestamp,station_id,temperature_c,quality_code",
+                # Malformed: missing station_id
+                "2024-01-01T00:00:00Z, ,12.3,OK",
+                # Malformed: non-finite
+                "2024-01-01T00:01:00Z,UTC-01,NaN,OK",
+                # Aware UTC
+                "2024-01-01T00:02:00Z,UTC-01,10.0,WARN",
+                # Naive NY (spring-forward gap) -> should shift and count shift even if suppressed
+                "2024-03-10T02:15:00,NY-01,5.0,OK",
+                # Same station/time neighborhood, later in file order
+                "2024-03-10T03:16:00,NY-01,6.0,EST",
+                # Alias chain should map NY-B -> NY-01
+                "2024-03-10T03:40:00,NY-B,7.0,OK",
+                # Fall-back ambiguity in NY; later UTC instant should be chosen
+                "2024-11-03T01:30:00,NY-01,8.0,WARN",
+                # Cycle station ids collapse to lexicographically smallest in cycle: CYC-1
+                "2024-01-02T00:00:00Z,CYC-2,9.0,OK",
+            ]
+
+            # Add some extra random noise rows in UTC (kept small for runtime).
+            for i in range(60):
+                station = rng.choice(["UTC-01", "NY-A", "NY-01"])
+                quality = rng.choice(list(QUALITY_CODES))
+                temp = rng.uniform(-20, 40)
+                ts = f"2024-01-03T00:{i:02d}:00Z"
+                lines.append(f"{ts},{station},{temp:.6f},{quality}")
+
+            INPUT_CSV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            shutil.rmtree("/app/output", ignore_errors=True)
+            proc = subprocess.run(
+                ["python3", str(SCRIPT_PATH)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=DEDUPE_SCRIPT_CWD,
+            )
+            assert proc.returncode == 0, proc.stderr
+
+            expected_rows, expected_stats = _reference_from_input()
+            _assert_csv_matches(expected_rows)
+            _assert_stats_matches(expected_stats)
+    finally:
+        INPUT_CSV.write_text(original_csv, encoding="utf-8")
+        REGISTRY_JSON.write_text(original_registry, encoding="utf-8")
