@@ -1,8 +1,4 @@
-# Use the tag only so Docker resolves the correct arch from the multi-arch manifest.
-# A single image digest (often amd64-only) causes "exec /bin/sh: exec format error" on
-# other hosts (e.g. arm64). To pin reproducibly across platforms, use the manifest
-# *index* digest from: docker buildx imagetools inspect python:3.13-slim-bookworm
-FROM python:3.13-slim-bookworm
+FROM python:3.13.13-slim-bookworm@sha256:eabbb62836ee44c18d350821e9f78488bcf65134bf763ae9989d63e611fa04d9
 
 WORKDIR /app
 

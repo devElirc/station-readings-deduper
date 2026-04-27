@@ -712,6 +712,49 @@ def test_half_open_boundaries_for_suppression_and_calibration():
         _rebuild_output_for_bundled_fixtures()
 
 
+def test_shifted_nonexistent_timestamp_is_counted_before_suppression():
+    """A shifted spring-forward timestamp must be counted even when suppressed."""
+    original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
+    original_registry = REGISTRY_JSON.read_text(encoding="utf-8")
+    try:
+        registry = {
+            "aliases": {},
+            "station_timezones": {"NY-01": "America/New_York"},
+            "suppressions": [
+                {"station_id": "NY-01", "start": "2024-03-10T07:00:00Z", "end": "2024-03-10T07:01:00Z"}
+            ],
+            "calibrations": [],
+        }
+        REGISTRY_JSON.write_text(json.dumps(registry), encoding="utf-8")
+        lines = [
+            "timestamp,station_id,temperature_c,quality_code",
+            "2024-03-10T02:15:00,NY-01,5.0,OK",
+            "2024-03-10T03:02:00,NY-01,6.0,WARN",
+        ]
+        INPUT_CSV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        shutil.rmtree("/app/output", ignore_errors=True)
+        proc = subprocess.run(
+            ["python3", str(SCRIPT_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=DEDUPE_SCRIPT_CWD,
+        )
+        assert proc.returncode == 0, proc.stderr
+        expected_rows, expected_stats = _reference_from_input()
+        _assert_csv_matches(expected_rows)
+        _assert_stats_matches(expected_stats)
+        data = json.loads(STATS_JSON.read_text(encoding="utf-8"))
+        assert data["shifted_nonexistent_timestamps"] == 1
+        assert data["skipped_suppressed_rows"] == 1
+        assert data["deduped_row_count"] == 1
+    finally:
+        INPUT_CSV.write_text(original_csv, encoding="utf-8")
+        REGISTRY_JSON.write_text(original_registry, encoding="utf-8")
+        _rebuild_output_for_bundled_fixtures()
+
+
 def test_quality_runs_and_longest_gap_minutes_are_utc_ordered():
     """quality_runs and longest_gap_minutes must be computed in UTC time order."""
     original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
