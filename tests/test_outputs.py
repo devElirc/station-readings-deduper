@@ -25,6 +25,24 @@ QUALITY_CODES = ("OK", "WARN", "EST")
 # against /app (prevents quietly opening harness files via relative paths).
 DEDUPE_SCRIPT_CWD = "/app"
 
+
+def _rebuild_output_for_bundled_fixtures() -> None:
+    """Regenerate /app/output from the CSV and registry currently on disk."""
+    assert SCRIPT_PATH.is_file(), "Expected /app/dedupe_report.py"
+    shutil.rmtree("/app/output", ignore_errors=True)
+    proc = subprocess.run(
+        ["python3", str(SCRIPT_PATH)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=DEDUPE_SCRIPT_CWD,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert DEDUPED_CSV.is_file() and STATS_JSON.is_file(), (
+        "dedupe_report.py must write /app/output/deduped.csv and stats.json"
+    )
+
+
 # Anti-cheat: benchmark / verifier trees the agent script must never read.
 _STRACE_FORBIDDEN_PREFIXES = ("/tests", "/oracle", "/solution", "/logs")
 
@@ -554,16 +572,46 @@ def test_stats_schema():
             assert isinstance(entry[key], str)
 
 
+def test_utf8_bom_in_station_readings_csv():
+    """Bundled CSV logic must tolerate a UTF-8 BOM (Excel-style exports)."""
+    assert SCRIPT_PATH.is_file()
+    body = INPUT_CSV.read_text(encoding="utf-8-sig")
+    original_bytes = INPUT_CSV.read_bytes()
+    try:
+        INPUT_CSV.write_bytes("\ufeff".encode("utf-8") + body.encode("utf-8"))
+        shutil.rmtree("/app/output", ignore_errors=True)
+        proc = subprocess.run(
+            ["python3", str(SCRIPT_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=DEDUPE_SCRIPT_CWD,
+        )
+        assert proc.returncode == 0, proc.stderr
+        expected_rows, expected_stats = _reference_from_input()
+        _assert_csv_matches(expected_rows)
+        _assert_stats_matches(expected_stats)
+    finally:
+        INPUT_CSV.write_bytes(original_bytes)
+        _rebuild_output_for_bundled_fixtures()
+
+
 def test_randomized_inputs_match_reference():
     """Extra adversarial cases to prevent overfitting the bundled fixtures."""
     original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
     original_registry = REGISTRY_JSON.read_text(encoding="utf-8")
     try:
-        for seed in range(45):
+        for seed in range(96):
             rng = random.Random(880_000 + seed)
 
             # Always include NY timezone so DST gap/overlap behavior is exercised.
-            zones = {"NY-01": "America/New_York", "UTC-01": "UTC"}
+            zones: dict[str, str] = {
+                "NY-01": "America/New_York",
+                "UTC-01": "UTC",
+            }
+            if seed % 17 == 0:
+                # Europe/London spring-forward gap (distinct rules from US Eastern).
+                zones["LD-01"] = "Europe/London"
 
             # Aliases: include a small chain and a 3-cycle.
             aliases = {
@@ -573,6 +621,10 @@ def test_randomized_inputs_match_reference():
                 "CYC-2": "CYC-3",
                 "CYC-3": "CYC-1",
             }
+            if seed % 23 == 0:
+                # 2-cycle collapses to lexicographically smallest id (AB-1).
+                aliases["AB-1"] = "AB-2"
+                aliases["AB-2"] = "AB-1"
 
             # Suppress NY around the shifted time after the spring-forward gap.
             suppressions = [
@@ -582,6 +634,15 @@ def test_randomized_inputs_match_reference():
                     "end": "2024-03-10T07:20:00Z",
                 }
             ]
+            if seed % 19 == 0:
+                # Second suppression window on another canonical station.
+                suppressions.append(
+                    {
+                        "station_id": "UTC-01",
+                        "start": "2024-01-03T00:20:00Z",
+                        "end": "2024-01-03T00:21:00Z",
+                    }
+                )
 
             # Two overlapping calibration windows to enforce tie-breaking.
             calibrations = [
@@ -640,10 +701,18 @@ def test_randomized_inputs_match_reference():
                 # -0.0 formatting: should become 0.0 in deduped.csv and stats strings
                 "2024-01-02T00:01:00Z,UTC-01,-0.04,OK",
             ]
+            if seed % 17 == 0:
+                # Naive local time in the UK spring-forward gap (must nudge + count).
+                lines.append("2024-03-31T01:30:00,LD-01,3.0,OK")
+            if seed % 23 == 0:
+                lines.append("2024-01-05T00:00:00Z,AB-2,1.0,OK")
 
+            noise_rows = 240 + (seed % 60)
             # Add extra random noise rows (mix of aware UTC and naive local).
-            for i in range(140):
-                station = rng.choice(["UTC-01", "NY-A", "NY-01"])
+            for i in range(noise_rows):
+                station = rng.choice(
+                    ["UTC-01", "NY-A", "NY-01", "NY-B", "CYC-2"]
+                )
                 quality = rng.choice(list(QUALITY_CODES))
                 temp = rng.uniform(-20, 40)
                 if rng.random() < 0.55:
@@ -657,7 +726,11 @@ def test_randomized_inputs_match_reference():
                     station = "UTC-01"
                 lines.append(f"{ts},{station},{temp:.6f},{quality}")
 
-            INPUT_CSV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            csv_payload = "\n".join(lines) + "\n"
+            if seed % 13 == 0:
+                INPUT_CSV.write_bytes(b"\xef\xbb\xbf" + csv_payload.encode("utf-8"))
+            else:
+                INPUT_CSV.write_text(csv_payload, encoding="utf-8")
 
             shutil.rmtree("/app/output", ignore_errors=True)
             proc = subprocess.run(
@@ -675,3 +748,4 @@ def test_randomized_inputs_match_reference():
     finally:
         INPUT_CSV.write_text(original_csv, encoding="utf-8")
         REGISTRY_JSON.write_text(original_registry, encoding="utf-8")
+        _rebuild_output_for_bundled_fixtures()
