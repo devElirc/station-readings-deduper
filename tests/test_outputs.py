@@ -665,6 +665,88 @@ def test_rounding_uses_python_round_half_even():
         _rebuild_output_for_bundled_fixtures()
 
 
+def test_half_open_boundaries_for_suppression_and_calibration():
+    """Suppression/calibration intervals must be start-inclusive, end-exclusive."""
+    original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
+    original_registry = REGISTRY_JSON.read_text(encoding="utf-8")
+    try:
+        registry = {
+            "aliases": {},
+            "station_timezones": {"UTC-01": "UTC"},
+            "suppressions": [
+                {"station_id": "UTC-01", "start": "2024-01-01T00:01:00Z", "end": "2024-01-01T00:02:00Z"}
+            ],
+            "calibrations": [
+                {"station_id": "UTC-01", "start": "2024-01-01T00:02:00Z", "end": "2024-01-01T00:03:00Z", "offset_c": 1.0}
+            ],
+        }
+        REGISTRY_JSON.write_text(json.dumps(registry), encoding="utf-8")
+        lines = [
+            "timestamp,station_id,temperature_c,quality_code",
+            # At suppression start -> suppressed
+            "2024-01-01T00:01:00Z,UTC-01,10.0,OK",
+            # At suppression end -> not suppressed
+            "2024-01-01T00:02:00Z,UTC-01,10.0,OK",
+            # At calibration start -> calibrated
+            "2024-01-01T00:02:30Z,UTC-01,10.0,OK",
+            # At calibration end -> not calibrated
+            "2024-01-01T00:03:00Z,UTC-01,10.0,OK",
+        ]
+        INPUT_CSV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        shutil.rmtree("/app/output", ignore_errors=True)
+        proc = subprocess.run(
+            ["python3", str(SCRIPT_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=DEDUPE_SCRIPT_CWD,
+        )
+        assert proc.returncode == 0, proc.stderr
+        expected_rows, expected_stats = _reference_from_input()
+        _assert_csv_matches(expected_rows)
+        _assert_stats_matches(expected_stats)
+    finally:
+        INPUT_CSV.write_text(original_csv, encoding="utf-8")
+        REGISTRY_JSON.write_text(original_registry, encoding="utf-8")
+        _rebuild_output_for_bundled_fixtures()
+
+
+def test_quality_runs_and_longest_gap_minutes_are_utc_ordered():
+    """quality_runs and longest_gap_minutes must be computed in UTC time order."""
+    original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
+    original_registry = REGISTRY_JSON.read_text(encoding="utf-8")
+    try:
+        registry = {"aliases": {}, "station_timezones": {"UTC-01": "UTC"}, "suppressions": [], "calibrations": []}
+        REGISTRY_JSON.write_text(json.dumps(registry), encoding="utf-8")
+        lines = [
+            "timestamp,station_id,temperature_c,quality_code",
+            # Out of order in file; stats must sort by UTC instant.
+            "2024-01-01T00:03:59Z,UTC-01,10.0,OK",
+            "2024-01-01T00:00:00Z,UTC-01,10.0,OK",
+            "2024-01-01T00:02:01Z,UTC-01,10.0,WARN",
+            "2024-01-01T00:02:00Z,UTC-01,10.0,WARN",
+        ]
+        INPUT_CSV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        shutil.rmtree("/app/output", ignore_errors=True)
+        proc = subprocess.run(
+            ["python3", str(SCRIPT_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=DEDUPE_SCRIPT_CWD,
+        )
+        assert proc.returncode == 0, proc.stderr
+        expected_rows, expected_stats = _reference_from_input()
+        _assert_csv_matches(expected_rows)
+        _assert_stats_matches(expected_stats)
+    finally:
+        INPUT_CSV.write_text(original_csv, encoding="utf-8")
+        REGISTRY_JSON.write_text(original_registry, encoding="utf-8")
+        _rebuild_output_for_bundled_fixtures()
+
+
 def test_randomized_inputs_match_reference():
     """Extra adversarial cases to prevent overfitting the bundled fixtures."""
     original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
