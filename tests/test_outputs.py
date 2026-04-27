@@ -747,6 +747,54 @@ def test_quality_runs_and_longest_gap_minutes_are_utc_ordered():
         _rebuild_output_for_bundled_fixtures()
 
 
+def test_large_input_finishes_and_matches_reference():
+    """Large input should still complete and match the reference output exactly."""
+    original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
+    original_registry = REGISTRY_JSON.read_text(encoding="utf-8")
+    try:
+        # Keep registry simple so the reference computation stays fast, but make the
+        # CSV large enough that quadratic-ish implementations time out.
+        registry = {
+            "aliases": {"S-A": "S-01", "S-B": "S-A"},
+            "station_timezones": {"S-01": "UTC"},
+            "suppressions": [],
+            "calibrations": [
+                {"station_id": "S-01", "start": "2024-01-01T00:00:00Z", "end": "2025-01-01T00:00:00Z", "offset_c": 0.1}
+            ],
+        }
+        REGISTRY_JSON.write_text(json.dumps(registry), encoding="utf-8")
+
+        rng = random.Random(123_456)
+        lines = ["timestamp,station_id,temperature_c,quality_code"]
+        for i in range(80_000):
+            # Force lots of collisions for last-wins behavior.
+            minute = i % 500
+            ts = f"2024-01-01T00:{minute:02d}:00Z"
+            station = rng.choice(["S-01", "S-A", "S-B"])
+            quality = rng.choice(list(QUALITY_CODES))
+            temp = rng.uniform(-30, 55)
+            lines.append(f"{ts},{station},{temp:.6f},{quality}")
+        INPUT_CSV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        shutil.rmtree("/app/output", ignore_errors=True)
+        proc = subprocess.run(
+            ["python3", str(SCRIPT_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            cwd=DEDUPE_SCRIPT_CWD,
+        )
+        assert proc.returncode == 0, proc.stderr
+
+        expected_rows, expected_stats = _reference_from_input()
+        _assert_csv_matches(expected_rows)
+        _assert_stats_matches(expected_stats)
+    finally:
+        INPUT_CSV.write_text(original_csv, encoding="utf-8")
+        REGISTRY_JSON.write_text(original_registry, encoding="utf-8")
+        _rebuild_output_for_bundled_fixtures()
+
+
 def test_randomized_inputs_match_reference():
     """Extra adversarial cases to prevent overfitting the bundled fixtures."""
     original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")

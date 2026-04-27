@@ -17,6 +17,8 @@ Resolve the row’s station id through the registry alias map before any timezon
 Aliases can chain. If you hit a cycle, collapse it to the lexicographically smallest id in the cycle. 
 Use this canonical id for timezone lookup, suppression/calibration lookup, the dedupe key, and outputs.
 
+You should assume hidden tests include large input files, so the implementation should be reasonably efficient (avoid quadratic passes over all rows).
+
 Parse timestamps with `datetime.fromisoformat` (rewrite a trailing `Z` to `+00:00` first). 
 If the parsed datetime is timezone-aware, convert it to UTC. If it is naive, interpret it as local wall time in the canonical station’s timezone using `zoneinfo` and the registry’s `station_timezones` mapping (default `UTC` if missing). If the local time is ambiguous (fall-back overlap), choose the later UTC instant. If the local time does not exist (spring-forward gap), nudge the naive time forward one minute at a time until it becomes valid; if any nudging happened for that row, increment `shifted_nonexistent_timestamps` by 1. Do this gap-shift before suppression checks so the shift counter still increments even if the row is later suppressed.
 
