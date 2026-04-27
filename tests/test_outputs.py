@@ -559,7 +559,7 @@ def test_randomized_inputs_match_reference():
     original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
     original_registry = REGISTRY_JSON.read_text(encoding="utf-8")
     try:
-        for seed in range(20):
+        for seed in range(45):
             rng = random.Random(880_000 + seed)
 
             # Always include NY timezone so DST gap/overlap behavior is exercised.
@@ -597,6 +597,13 @@ def test_randomized_inputs_match_reference():
                     "end": "2024-03-10T08:00:00Z",
                     "offset_c": -0.25,
                 },
+                # Same start as the previous entry to force tie-break-by-file-index.
+                {
+                    "station_id": "NY-01",
+                    "start": "2024-03-10T07:30:00Z",
+                    "end": "2024-03-10T08:00:00Z",
+                    "offset_c": 0.125,
+                },
             ]
 
             registry = {
@@ -614,6 +621,10 @@ def test_randomized_inputs_match_reference():
                 "2024-01-01T00:00:00Z, ,12.3,OK",
                 # Malformed: non-finite
                 "2024-01-01T00:01:00Z,UTC-01,NaN,OK",
+                # Malformed: bad quality
+                "2024-01-01T00:01:30Z,UTC-01,10.0,BAD",
+                # Malformed: blank temp
+                "2024-01-01T00:01:45Z,UTC-01, ,OK",
                 # Aware UTC
                 "2024-01-01T00:02:00Z,UTC-01,10.0,WARN",
                 # Naive NY (spring-forward gap) -> should shift and count shift even if suppressed
@@ -626,14 +637,24 @@ def test_randomized_inputs_match_reference():
                 "2024-11-03T01:30:00,NY-01,8.0,WARN",
                 # Cycle station ids collapse to lexicographically smallest in cycle: CYC-1
                 "2024-01-02T00:00:00Z,CYC-2,9.0,OK",
+                # -0.0 formatting: should become 0.0 in deduped.csv and stats strings
+                "2024-01-02T00:01:00Z,UTC-01,-0.04,OK",
             ]
 
-            # Add some extra random noise rows in UTC (kept small for runtime).
-            for i in range(60):
+            # Add extra random noise rows (mix of aware UTC and naive local).
+            for i in range(140):
                 station = rng.choice(["UTC-01", "NY-A", "NY-01"])
                 quality = rng.choice(list(QUALITY_CODES))
                 temp = rng.uniform(-20, 40)
-                ts = f"2024-01-03T00:{i:02d}:00Z"
+                if rng.random() < 0.55:
+                    ts = f"2024-01-03T00:{(i % 60):02d}:00Z"
+                else:
+                    # Naive wall time; NY rows will exercise zoneinfo handling.
+                    ts = f"2024-01-03T00:{(i % 60):02d}:00"
+                # Occasionally create deliberate duplicates so last-wins is exercised.
+                if i in (20, 21, 22):
+                    ts = "2024-01-03T00:20:00Z"
+                    station = "UTC-01"
                 lines.append(f"{ts},{station},{temp:.6f},{quality}")
 
             INPUT_CSV.write_text("\n".join(lines) + "\n", encoding="utf-8")
