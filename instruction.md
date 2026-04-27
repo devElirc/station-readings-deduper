@@ -1,12 +1,24 @@
-We’re getting double-counted station readings under `/app` after a registry update. Write `/app/dedupe_report.py` to rebuild a clean dataset and a stats report.
+I am getting double-counted station readings under `/app` after a registry update. 
+Write `/app/dedupe_report.py` to rebuild a clean dataset and a stats report.
 
-The first line must be exactly `#!/usr/bin/env python3`, and the script must be executable. The harness runs from `/app`. While running, your script may only read `/app/inputs/station_readings.csv` and `/app/inputs/station_registry.json`. It must write `/app/output/deduped.csv` and `/app/output/stats.json` (create `/app/output` if needed). Do not read or import anything under `/tests`, `/oracle`, `/solution`, or `/logs`.
+The first line must be exactly `#!/usr/bin/env python3`, and the script must be executable. 
+The harness runs from `/app`. While running, your script may only read `/app/inputs/station_readings.csv` and `/app/inputs/station_registry.json`. 
+It must write `/app/output/deduped.csv` and `/app/output/stats.json` (create `/app/output` if needed). 
+Do not read or import anything under `/tests`, `/oracle`, `/solution`, or `/logs`.
 
-The CSV columns are `timestamp`, `station_id`, `temperature_c`, `quality_code`. The file may start with a UTF-8 BOM, so open it with BOM-safe UTF-8 decoding (for example `encoding="utf-8-sig"`). For each row, strip ASCII whitespace from every field. If the stripped `timestamp` or `station_id` is empty, if `temperature_c` is blank / not a float / not finite, if `quality_code` is not exactly `OK`, `WARN`, or `EST`, or if the timestamp cannot be parsed as described below, skip the row and increment `skipped_malformed_rows`.
+The CSV columns are `timestamp`, `station_id`, `temperature_c`, `quality_code`. 
+The file may start with a UTF-8 BOM, so open it with BOM-safe UTF-8 decoding (for example `encoding="utf-8-sig"`). 
+For each row, strip ASCII whitespace from every field. If the stripped `timestamp` or `station_id` is empty, if `temperature_c` is blank / not a float / not finite, if `quality_code` is not exactly `OK`, `WARN`, or `EST`, or if the timestamp cannot be parsed as described below, skip the row and increment `skipped_malformed_rows`.
 
-Resolve the row’s station id through the registry alias map before any timezone work. Aliases can chain. If you hit a cycle, collapse it to the lexicographically smallest id in the cycle. Use this canonical id for timezone lookup, suppression/calibration lookup, the dedupe key, and outputs.
+Use only the Python standard library. 
+Do not use dynamic code execution (`eval`, `exec`, `compile`, or `__import__`) and do not rely on third-party helper libraries like numpy/pandas/pytz/dateutil.
 
-Parse timestamps with `datetime.fromisoformat` (rewrite a trailing `Z` to `+00:00` first). If the parsed datetime is timezone-aware, convert it to UTC. If it is naive, interpret it as local wall time in the canonical station’s timezone using `zoneinfo` and the registry’s `station_timezones` mapping (default `UTC` if missing). If the local time is ambiguous (fall-back overlap), choose the later UTC instant. If the local time does not exist (spring-forward gap), nudge the naive time forward one minute at a time until it becomes valid; if any nudging happened for that row, increment `shifted_nonexistent_timestamps` by 1. Do this gap-shift before suppression checks so the shift counter still increments even if the row is later suppressed.
+Resolve the row’s station id through the registry alias map before any timezone work. 
+Aliases can chain. If you hit a cycle, collapse it to the lexicographically smallest id in the cycle. 
+Use this canonical id for timezone lookup, suppression/calibration lookup, the dedupe key, and outputs.
+
+Parse timestamps with `datetime.fromisoformat` (rewrite a trailing `Z` to `+00:00` first). 
+If the parsed datetime is timezone-aware, convert it to UTC. If it is naive, interpret it as local wall time in the canonical station’s timezone using `zoneinfo` and the registry’s `station_timezones` mapping (default `UTC` if missing). If the local time is ambiguous (fall-back overlap), choose the later UTC instant. If the local time does not exist (spring-forward gap), nudge the naive time forward one minute at a time until it becomes valid; if any nudging happened for that row, increment `shifted_nonexistent_timestamps` by 1. Do this gap-shift before suppression checks so the shift counter still increments even if the row is later suppressed.
 
 Timezone keys in `station_timezones` may themselves be aliases. When building the canonical station id → timezone mapping, resolve each key to a canonical id. If multiple `station_timezones` entries resolve to the same canonical id, the later entry in the registry file wins.
 

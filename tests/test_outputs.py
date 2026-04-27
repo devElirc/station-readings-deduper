@@ -1,5 +1,6 @@
 """Verify registry-aware station CSV dedupe, path policy, and outputs."""
 
+import ast
 import csv
 import json
 import math
@@ -20,6 +21,16 @@ SCRIPT_PATH = Path("/app/dedupe_report.py")
 DEDUPED_CSV = Path("/app/output/deduped.csv")
 STATS_JSON = Path("/app/output/stats.json")
 QUALITY_CODES = ("OK", "WARN", "EST")
+FORBIDDEN_IMPORTS = {
+    "numpy",
+    "pandas",
+    "pytz",
+    "dateutil",
+    "pendulum",
+    "arrow",
+    "requests",
+}
+FORBIDDEN_CALLS = {"eval", "exec", "compile", "__import__"}
 
 # CWD for subprocess runs of /app/dedupe_report.py so strace resolves relative paths
 # against /app (prevents quietly opening harness files via relative paths).
@@ -83,6 +94,24 @@ def ensure_output_artifacts():
     assert DEDUPED_CSV.is_file() and STATS_JSON.is_file(), (
         "expected /app/dedupe_report.py to write /app/output/deduped.csv and stats.json"
     )
+
+
+def _check_ast_constraints() -> None:
+    """Disallow shortcut libraries and dangerous dynamic code execution."""
+    src = SCRIPT_PATH.read_text(encoding="utf-8", errors="strict")
+    tree = ast.parse(src, filename=str(SCRIPT_PATH))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                assert top not in FORBIDDEN_IMPORTS, f"forbidden import: {top}"
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            top = node.module.split(".")[0]
+            assert top not in FORBIDDEN_IMPORTS, f"forbidden import from: {top}"
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            assert node.func.id not in FORBIDDEN_CALLS, (
+                f"forbidden call: {node.func.id}()"
+            )
 
 
 def _strace_collect_path_arguments(log_text: str) -> set[str]:
@@ -430,6 +459,12 @@ def test_script_compiles():
     assert proc.returncode == 0, proc.stderr
 
 
+def test_ast_forbidden_imports_and_calls():
+    """AST-check that dedupe_report.py uses no forbidden libraries/builtins."""
+    assert SCRIPT_PATH.is_file()
+    _check_ast_constraints()
+
+
 def test_script_rebuild_under_strace_respects_app_paths():
     """Run a clean rebuild under strace; forbid harness paths; only allowed /app opens."""
     if shutil.which("strace") is None:
@@ -593,6 +628,40 @@ def test_utf8_bom_in_station_readings_csv():
         _assert_stats_matches(expected_stats)
     finally:
         INPUT_CSV.write_bytes(original_bytes)
+        _rebuild_output_for_bundled_fixtures()
+
+
+def test_rounding_uses_python_round_half_even():
+    """Temperatures must be formatted via str(round(x, 1)) (ties use half-even)."""
+    original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
+    original_registry = REGISTRY_JSON.read_text(encoding="utf-8")
+    try:
+        registry = {"aliases": {}, "station_timezones": {"UTC-01": "UTC"}, "suppressions": [], "calibrations": []}
+        REGISTRY_JSON.write_text(json.dumps(registry), encoding="utf-8")
+        lines = [
+            "timestamp,station_id,temperature_c,quality_code",
+            "2024-01-01T00:00:00Z,UTC-01,1.25,OK",
+            "2024-01-01T00:01:00Z,UTC-01,1.35,OK",
+            "2024-01-01T00:02:00Z,UTC-01,-1.25,OK",
+            "2024-01-01T00:03:00Z,UTC-01,-1.35,OK",
+        ]
+        INPUT_CSV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        shutil.rmtree("/app/output", ignore_errors=True)
+        proc = subprocess.run(
+            ["python3", str(SCRIPT_PATH)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=DEDUPE_SCRIPT_CWD,
+        )
+        assert proc.returncode == 0, proc.stderr
+        expected_rows, expected_stats = _reference_from_input()
+        _assert_csv_matches(expected_rows)
+        _assert_stats_matches(expected_stats)
+    finally:
+        INPUT_CSV.write_text(original_csv, encoding="utf-8")
+        REGISTRY_JSON.write_text(original_registry, encoding="utf-8")
         _rebuild_output_for_bundled_fixtures()
 
 
