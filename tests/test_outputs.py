@@ -601,17 +601,27 @@ def test_randomized_inputs_match_reference():
     original_csv = INPUT_CSV.read_text(encoding="utf-8-sig")
     original_registry = REGISTRY_JSON.read_text(encoding="utf-8")
     try:
-        for seed in range(96):
+        for seed in range(192):
             rng = random.Random(880_000 + seed)
 
             # Always include NY timezone so DST gap/overlap behavior is exercised.
-            zones: dict[str, str] = {
-                "NY-01": "America/New_York",
-                "UTC-01": "UTC",
-            }
+            zones: dict[str, str] = {"UTC-01": "UTC"}
+            if seed % 37 == 0:
+                # Timezone only under an alias key (resolves to canonical NY-01).
+                zones["NY-B"] = "America/New_York"
+            else:
+                zones["NY-01"] = "America/New_York"
             if seed % 17 == 0:
                 # Europe/London spring-forward gap (distinct rules from US Eastern).
                 zones["LD-01"] = "Europe/London"
+            if seed % 29 == 0:
+                # US Pacific fall-back overlap (different offset than America/New_York).
+                zones["LA-01"] = "America/Los_Angeles"
+            if seed % 53 == 0:
+                # Conflicting timezone mapping after alias resolution: later entry must win.
+                # NY-B resolves to NY-01, so this pair forces "last wins" on zones["NY-01"].
+                zones["NY-B"] = "UTC"
+                zones["NY-01"] = "America/New_York"
 
             # Aliases: include a small chain and a 3-cycle.
             aliases = {
@@ -621,6 +631,8 @@ def test_randomized_inputs_match_reference():
                 "CYC-2": "CYC-3",
                 "CYC-3": "CYC-1",
             }
+            if seed % 41 == 0:
+                aliases["NY-C"] = "NY-B"
             if seed % 23 == 0:
                 # 2-cycle collapses to lexicographically smallest id (AB-1).
                 aliases["AB-1"] = "AB-2"
@@ -641,6 +653,15 @@ def test_randomized_inputs_match_reference():
                         "station_id": "UTC-01",
                         "start": "2024-01-03T00:20:00Z",
                         "end": "2024-01-03T00:21:00Z",
+                    }
+                )
+            if seed % 47 == 0:
+                # Adjacent suppression on NY-01 (half-open boundary behavior).
+                suppressions.append(
+                    {
+                        "station_id": "NY-01",
+                        "start": "2024-03-10T07:20:00Z",
+                        "end": "2024-03-10T07:25:00Z",
                     }
                 )
 
@@ -666,6 +687,34 @@ def test_randomized_inputs_match_reference():
                     "offset_c": 0.125,
                 },
             ]
+            if seed % 31 == 0:
+                # Same start instant on UTC-01: later registry entry must win.
+                calibrations.extend(
+                    [
+                        {
+                            "station_id": "UTC-01",
+                            "start": "2024-01-03T00:19:00Z",
+                            "end": "2024-01-03T00:25:00Z",
+                            "offset_c": 1.0,
+                        },
+                        {
+                            "station_id": "UTC-01",
+                            "start": "2024-01-03T00:19:00Z",
+                            "end": "2024-01-03T00:25:00Z",
+                            "offset_c": 2.0,
+                        },
+                    ]
+                )
+            if seed % 43 == 0:
+                # Calibration keyed by canonical cycle representative CYC-1.
+                calibrations.append(
+                    {
+                        "station_id": "CYC-1",
+                        "start": "2024-01-01T00:00:00Z",
+                        "end": "2024-01-03T00:00:00Z",
+                        "offset_c": -1.5,
+                    }
+                )
 
             registry = {
                 "aliases": aliases,
@@ -688,6 +737,9 @@ def test_randomized_inputs_match_reference():
                 "2024-01-01T00:01:45Z,UTC-01, ,OK",
                 # Aware UTC
                 "2024-01-01T00:02:00Z,UTC-01,10.0,WARN",
+                # Same instant, different timestamp text; last-in-file-order must win and
+                # deduped.csv must preserve the winning *original* timestamp string.
+                "2024-01-01T00:02:00+00:00,UTC-01,10.1,OK",
                 # Naive NY (spring-forward gap) -> should shift and count shift even if suppressed
                 "2024-03-10T02:15:00,NY-01,5.0,OK",
                 # Same station/time neighborhood, later in file order
@@ -704,15 +756,25 @@ def test_randomized_inputs_match_reference():
             if seed % 17 == 0:
                 # Naive local time in the UK spring-forward gap (must nudge + count).
                 lines.append("2024-03-31T01:30:00,LD-01,3.0,OK")
+            if seed % 29 == 0:
+                # Pacific fall-back ambiguous wall time (later UTC fold).
+                lines.append("2024-11-03T01:30:00,LA-01,4.0,OK")
             if seed % 23 == 0:
                 lines.append("2024-01-05T00:00:00Z,AB-2,1.0,OK")
 
-            noise_rows = 240 + (seed % 60)
+            noise_rows = 320 + (seed % 100)
             # Add extra random noise rows (mix of aware UTC and naive local).
             for i in range(noise_rows):
-                station = rng.choice(
-                    ["UTC-01", "NY-A", "NY-01", "NY-B", "CYC-2"]
-                )
+                station_choices = [
+                    "UTC-01",
+                    "NY-A",
+                    "NY-01",
+                    "NY-B",
+                    "CYC-2",
+                ]
+                if seed % 41 == 0:
+                    station_choices.append("NY-C")
+                station = rng.choice(station_choices)
                 quality = rng.choice(list(QUALITY_CODES))
                 temp = rng.uniform(-20, 40)
                 if rng.random() < 0.55:
@@ -737,7 +799,7 @@ def test_randomized_inputs_match_reference():
                 ["python3", str(SCRIPT_PATH)],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=180,
                 cwd=DEDUPE_SCRIPT_CWD,
             )
             assert proc.returncode == 0, proc.stderr

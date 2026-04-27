@@ -1,17 +1,138 @@
-We’re getting double-counted station readings under `/app` after the registry update, and I need a small Python script at `/app/dedupe_report.py` to clean it up.
+We’re getting double-counted station readings under `/app` after a registry update. Please write a small Python script at `/app/dedupe_report.py` that rebuilds a clean, deduplicated dataset plus summary statistics.
 
-Write `/app/dedupe_report.py` with the first line exactly `#!/usr/bin/env python3`, and mark it executable (`chmod +x`). The harness runs you with cwd `/app`. While your script runs, it must only read these inputs: `/app/inputs/station_readings.csv` and `/app/inputs/station_registry.json`. Create `/app/output` if needed, then write `/app/output/deduped.csv` and `/app/output/stats.json`. Do not read or import anything under `/tests`, `/oracle`, `/solution`, or `/logs`.
+Create /app/dedupe_report.py and make sure it can run as an executable script.
 
-The CSV may start with a UTF-8 BOM. Open it with BOM-aware UTF-8 decoding (for example Python’s `encoding="utf-8-sig"`) so a leading U+FEFF is not treated as part of the first column name. It has columns `timestamp`, `station_id`, `temperature_c`, `quality_code`. After reading each row, strip ASCII whitespace from every field. If the stripped `timestamp` or `station_id` is empty, if `temperature_c` is blank / not a float / not finite, if `quality_code` is not exactly `OK`, `WARN`, or `EST`, or if the timestamp cannot be parsed as described below, then skip the row and increment `skipped_malformed_rows`.
+The first line must be exactly #!/usr/bin/env python3.
 
-Before you parse timezones, resolve the input station id through the registry alias map to a canonical id. Alias chains can be multiple hops. If you hit a cycle, collapse it to the lexicographically smallest id in the cycle. Use the canonical id for everything else (timezone, suppression, calibration, dedupe key, and outputs).
+The test runner will run the script from the /app folder.
 
-Parse timestamps with `datetime.fromisoformat` (first rewrite a trailing `Z` to `+00:00`). If the parsed datetime is timezone-aware, convert it to UTC. If it is naive, interpret it as local wall time in the canonical station’s timezone using `zoneinfo` and the registry’s `station_timezones` mapping (default to `UTC` if missing). If the local wall time is ambiguous (fall-back overlap), choose the later UTC instant. If the local wall time does not exist (spring-forward gap), nudge the naive clock forward one minute at a time until it exists, then use that instant; if a row needed at least one nudge, increment `shifted_nonexistent_timestamps` by 1 for that row. Do the gap-shift step before suppression checks, so a shifted row still increments the counter even if it is later suppressed. A shifted row is not malformed unless some other check already failed.
+When the script runs, it should only read /app/inputs/station_readings.csv and /app/inputs/station_registry.json.
 
-After you have the final UTC instant, apply suppression and calibration in this order. If the instant falls in any suppression window for the canonical station id, skip it and increment `skipped_suppressed_rows`. Suppression windows are UTC half-open intervals (start inclusive, end exclusive). If the row is not suppressed, apply any matching calibration window (also UTC half-open): add its `offset_c` to the temperature. If multiple calibration windows match, choose the one with the latest start time, breaking ties by the later entry in the registry file.
+The script should save the output files as /app/output/deduped.csv and /app/output/stats.json.
 
-Now deduplicate by (canonical station id, final UTC instant). If multiple rows collide, the last row in file order wins. Build both outputs from this deduped set.
+Create the /app/output folder if it does not already exist.
 
-Write `/app/output/deduped.csv` with header `timestamp,station_id,temperature_c,quality_code` in that order. For each kept row, write the winner’s stripped timestamp string, the canonical station id, the calibrated temperature formatted as `str(round(x, 1))` (but write `-0.0` as `0.0`), and the quality code. Sort rows by station_id (string order) then by UTC instant.
+Do not read from or import anything inside /tests, /oracle, /solution, or /logs.
 
-Write `/app/output/stats.json` as ordinary JSON with exactly these top-level keys: `duplicate_rows_dropped`, `skipped_malformed_rows`, `skipped_suppressed_rows`, `shifted_nonexistent_timestamps`, `deduped_row_count`, `station_count`, `median_temperature_c_all`, `global_quality_counts`, and `stations`. The first six are integers; `median_temperature_c_all` is the same one-decimal string format used in the CSV; `global_quality_counts` is an object with exactly `OK`, `WARN`, `EST` integer counts; and `stations` is a list sorted by station_id. Each station entry must have exactly these keys: `station_id`, `readings` (int), `min_temperature_c`, `max_temperature_c`, `median_temperature_c`, `avg_temperature_c` (mean; this exact key), `quality_counts` (same OK/WARN/EST integer object shape), `longest_gap_minutes` (largest whole-minute gap between consecutive kept UTC times, or null if only one reading), and `quality_runs` (int). Compute medians by sorting numeric values and averaging the two middle values when the count is even. Define `quality_runs` as 1 plus the number of times the quality code changes when you walk that station’s kept readings in UTC order (a single reading gives 1). Format all the station temperature strings (`min_`, `max_`, `median_`, `avg_`) the same way as CSV temperatures, including mapping `-0.0` to `0.0`.
+/app/inputs/station_readings.csv contains four columns: timestamp, station_id, temperature_c, and quality_code.
+
+The CSV file may start with a UTF-8 BOM. Open it with BOM-safe UTF-8 decoding, such as encoding="utf-8-sig", so the BOM does not become part of the first column name.
+
+For each row, remove extra ASCII whitespace from every field.
+
+If timestamp or station_id is empty after trimming, skip that row and increase skipped_malformed_rows.
+
+If temperature_c is empty, not a valid float, or not a finite number, skip that row and increase skipped_malformed_rows.
+
+If quality_code is not exactly OK, WARN, or EST, skip that row and increase skipped_malformed_rows.
+
+If the timestamp cannot be parsed using the timestamp rules below, skip that row and increase skipped_malformed_rows.
+
+Before doing any timezone work, convert the input station_id to its canonical station id using the registry aliases map.
+
+Alias chains may have more than one step.
+
+If an alias chain has a cycle, use the smallest station id in that cycle by lexicographic order as the canonical id.
+
+Use the canonical id for everything else: timezone lookup, suppression/calibration lookup, dedupe key, and all outputs.
+
+Keys in `station_timezones` may be aliases too. When building the mapping from canonical station id → IANA zone name, resolve each timezone key to a canonical id. If multiple `station_timezones` entries resolve to the same canonical id, the **later** entry in the registry file wins.
+
+Parse each timestamp with datetime.fromisoformat.
+
+Before parsing, replace a trailing Z with +00:00.
+
+If the parsed timestamp already has timezone information, convert it to UTC.
+
+If the timestamp has no timezone information, treat it as local time for that canonical station.
+
+Use zoneinfo and the station timezone from the registry’s station_timezones map.
+
+If the station has no timezone in the registry, use UTC.
+
+If the local time is ambiguous during a fall-back time change, choose the later UTC time.
+
+If the local time does not exist during a spring-forward time change, move the time forward one minute at a time until it becomes valid.
+
+If a row needed this time adjustment, increase shifted_nonexistent_timestamps by 1 for that row.
+
+Do this time adjustment before checking suppression windows.
+
+So even if the row is later skipped because of suppression, it should still count in shifted_nonexistent_timestamps.
+
+A shifted timestamp should not count as malformed unless another validation rule already failed.
+
+After you have the final UTC time, process the row in this order.
+
+First, check suppression.
+
+If the UTC time falls inside a suppression window for that canonical station, skip the row and increase skipped_suppressed_rows.
+
+Suppression windows use UTC half-open ranges, meaning the start time is included and the end time is not included.
+
+Second, apply calibration if the row was not suppressed.
+
+If the UTC time falls inside a calibration window, add that window’s offset_c value to the temperature.
+
+Calibration windows also use UTC half-open ranges.
+
+If more than one calibration window matches, use the one with the latest start time.
+
+If there is still a tie, use the later entry from the registry file.
+
+Third, deduplicate the rows.
+
+Use (canonical station id, final UTC time) as the dedupe key.
+
+If multiple rows have the same key, keep the last one from the CSV file.
+
+Build both output files from this final deduplicated data.
+Write the cleaned CSV file to /app/output/deduped.csv.
+
+The CSV header must be exactly:
+
+timestamp,station_id,temperature_c,quality_code
+
+Keep the columns in that same order.
+
+For each kept row, write the cleaned input timestamp, the canonical station id, the calibrated temperature, and the quality code.
+
+Format the temperature with str(round(x, 1)).
+
+If the formatted temperature becomes -0.0, write it as 0.0.
+
+Sort the CSV rows by station_id first, then by the final UTC time.
+
+Write the summary JSON file to /app/output/stats.json.
+
+The JSON must contain exactly these top-level fields:
+
+duplicate_rows_dropped, skipped_malformed_rows, skipped_suppressed_rows, shifted_nonexistent_timestamps, deduped_row_count, station_count, median_temperature_c_all, global_quality_counts, and stations.
+
+The first six fields must be integers.
+
+Format median_temperature_c_all as a one-decimal string, using the same temperature format as the CSV.
+
+global_quality_counts must include exactly three counts: OK, WARN, and EST.
+
+The stations list must be sorted by station_id.
+
+Each station item must contain exactly these fields:
+
+station_id, readings, min_temperature_c, max_temperature_c, median_temperature_c, avg_temperature_c, quality_counts, longest_gap_minutes, and quality_runs.
+
+For each station, calculate the median by sorting the temperatures.
+
+If the station has an even number of readings, average the two middle values.
+
+avg_temperature_c must be the mean temperature.
+
+quality_runs should count how many continuous quality-code groups the station has in UTC order.
+
+A station with one reading has quality_runs equal to 1.
+
+longest_gap_minutes should be the largest full-minute gap between two consecutive UTC readings.
+
+If a station has only one reading, set longest_gap_minutes to null.
+
+Format all station temperature fields with the same one-decimal format, and write -0.0 as 0.0.
